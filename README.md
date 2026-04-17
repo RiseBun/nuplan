@@ -1,398 +1,183 @@
-# NuPlan Critic 训练框架 - 三层评估体系
+# NuPlan Action-Conditioned Critic 训练框架
 
-## 0. 项目定位
+## 项目概述
 
-本项目实现的是一个 **Action-Conditioned Future Consequence Evaluator**（动作条件化未来结果评估器）。
+本项目实现了一个 **Action-Conditioned Future Consequence Evaluator**（动作条件化未来结果评估器），用于评估自动驾驶场景中给定当前观测和动作候选，未来轨迹的合理性。
 
-**核心目标**：学习在 nuPlan 驾驶数据分布下，给定当前图像和 ego action，合理未来图像应该长成什么样的统计规律。
-
-**三层评估框架**：
-- **Layer 1**: 生成质量评估（生成图像 vs 真实图像的相似度）
-- **Layer 2**: Action一致性评估（生成未来是否符合给定action）
-- **Layer 3**: 驾驶合理性评估（未来是否驾驶合理、安全）
-
-**最终目标**：证明所提 visual-action metric 与 nuPlan 闭环性能的相关性高于传统 FID/FVD。
+**核心功能**：
+- 学习 nuPlan 驾驶数据分布下，图像观测与动作一致性的统计规律
+- 提供多维度评估能力（一致性、速度、转向、前进、时间连贯性、驾驶合理性）
+- 支持 Ranking 评估（NDCG、MRR、Top-1 Hit Rate）
+- 完整的训练 pipeline，支持本地和分布式训练
 
 ---
 
-## 1. 项目目标
+## Pipeline 架构
 
-本目录实现的是一个 `NuPlan Action-Conditioned Critic` 的第一版最小可训练框架。
-
-当前版本目标不是直接生成未来，而是学习一个打分器：
-
-- 输入：
-  - 历史前视图像
-  - 当前 ego 状态
-  - 一段候选未来轨迹
-- 输出：
-  - 一个 `match / mismatch` 分数
-
-这个分数可以理解为：
-
-- 当前图像观察和候选动作是否一致
-- 当前状态是否真的会导向该候选未来轨迹
-
-当前版本属于第一阶段：
-
-- 已支持：`history image + ego state + candidate trajectory -> score`
-- 未支持：`candidate future image` 作为额外输入
-
-后续可以在这个框架基础上扩展到完整的图像版 critic。
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        数据准备阶段                              │
+├─────────────────────────────────────────────────────────────────┤
+│  nuPlan DB 文件  ──┐                                            │
+│                    ├──► 索引构建 ──► train/val JSONL 索引文件    │
+│  相机图像目录  ────┘                                            │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        模型训练阶段                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  输入:                                                           │
+│  ├─ 历史图像序列 (CAM_F0, 4帧)                                  │
+│  ├─ 当前 Ego 状态 (速度、航向、加速度、角速度)                   │
+│  └─ 候选未来轨迹 (8步, 每步0.5s)                                │
+│                                                                  │
+│  模型:                                                           │
+│  ├─ Image Encoder (CNN + Projection)                            │
+│  ├─ Trajectory Encoder (MLP)                                    │
+│  ├─ Ego State Encoder (MLP)                                     │
+│  └─ 多维度评估头 (6个head)                                      │
+│                                                                  │
+│  训练:                                                           │
+│  ├─ 正样本: 真实轨迹 (label=1)                                  │
+│  ├─ 负样本: 随机错配轨迹 (label=0)                              │
+│  └─ Loss: 多维度加权 BCE                                        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                        评估阶段                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  ├─ 分类准确率 (Accuracy)                                       │
+│  ├─ Ranking 指标 (NDCG@3/5, MRR, Top-1)                         │
+│  └─ 多维度一致性分数                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 2. 当前目录结构
+## 目录结构
 
-```text
-/mnt/cpfs/prediction/lipeinan/nuplan/
-  README.md
-  use.md
-  dlc_train.sh
-  train.py
-  configs/
-    train_critic_mini.py
-  tools/
-    build_critic_index.py
-  indices/
-    critic_train.jsonl
-    critic_val.jsonl
-    critic_index_summary.json
-  work_dirs/
 ```
-
-各文件作用如下：
-
-- `use.md`
-  - 原始任务描述
-- `README.md`
-  - 当前这份说明文档
-- `dlc_train.sh`
-  - DLC 平台训练入口脚本
-- `train.py`
-  - 第一版训练主程序
-- `configs/train_critic_mini.py`
-  - 第一版训练配置
-- `tools/build_critic_index.py`
-  - 从 `nuPlan mini db + mini_set 相机图片` 生成训练索引
-- `indices/critic_train.jsonl`
-  - 训练集索引
-- `indices/critic_val.jsonl`
-  - 验证集索引
-- `indices/critic_index_summary.json`
-  - 索引构建摘要
+nuplan/
+├── README.md                      # 项目说明文档
+├── train.py                       # 训练主程序（支持本地/分布式）
+├── eval_critic.py                 # 模型评估脚本
+├── closed_loop_evaluation.py      # 闭环评估（待完善）
+│
+├── configs/                       # 配置文件目录
+│   ├── train_critic_mini.py       # 基础 critic 训练配置
+│   └── train_consistency_mini.py  # 多维度一致性 critic 配置
+│
+├── tools/                         # 工具脚本
+│   ├── build_critic_index.py      # 构建基础 critic 索引
+│   └── build_consistency_index.py # 构建一致性 critic 索引
+│
+├── indices/                       # 数据索引（JSONL格式）
+│   ├── critic_train.jsonl         # 训练集索引
+│   ├── critic_val.jsonl           # 验证集索引
+│   ├── consistency_train.jsonl    # 一致性训练集索引
+│   └── consistency_val.jsonl      # 一致性验证集索引
+│
+├── generation/                    # 未来图像生成模块
+│   ├── drivingworld_wrapper.py    # DrivingWorld 集成
+│   └── drivewm_wrapper.py         # DriveWM 集成
+│
+├── evaluation/                    # 评估指标计算
+│   ├── fid_calculator.py          # FID 计算
+│   ├── fvd_calculator.py          # FVD 计算
+│   └── lpips_calculator.py        # LPIPS 计算
+│
+├── scripts/                       # 运行脚本
+│   └── dlc_train.sh               # DLC 平台分布式训练入口
+│
+├── work_dirs/                     # 实验输出目录
+│   └── {experiment_name}/
+│       ├── checkpoints/           # 模型检查点
+│       ├── config_snapshot.json   # 配置快照
+│       └── eval_results.json      # 评估结果
+│
+└── DrivingWorld/                  # World Model 子模块（git submodule）
+```
 
 ---
 
-## 3. 数据依赖
+## 数据流与工作流程
 
-### 3.1 图片目录
+### 1. 数据准备
 
-当前使用的是你已经下载并解压的 `mini_set` 相机图片：
+#### 1.1 数据依赖
 
-```text
-/mnt/cpfs/prediction/lipeinan/nuplan_data/mini_set
-```
+项目需要以下数据：
 
-目前已经使用到：
-
-- `nuplan-v1.1_mini_camera_0`
-- `nuplan-v1.1_mini_camera_1`
-
-单个场景目录结构类似：
-
-```text
-nuplan-v1.1_mini_camera_0/
-  2021.05.25.14.16.10_veh-35_01690_02183/
-    CAM_F0/
-    CAM_B0/
-    CAM_L0/
-    CAM_L1/
-    CAM_L2/
-    CAM_R0/
-    CAM_R1/
-    CAM_R2/
-```
-
-当前训练版本只使用：
-
-- `CAM_F0`
-
-### 3.2 mini db 目录
-
-当前索引构建使用的是：
-
-```text
+**nuPlan 数据库文件**：
+```bash
 /mnt/datasets/e2e-datasets/20260227/e2e-datasets/dataset_pkgs/nuplan-v1.1/splits/mini
 ```
 
-这些 `db` 文件提供了：
-
-- 图像文件名 `filename_jpg`
-- 图像时间戳 `timestamp`
-- ego pose
-- ego 速度
-- 相机通道信息
-
-### 3.3 为什么必须用 db
-
-图片目录中的文件名是 token，例如：
-
-```text
-14fffca1394c537d.jpg
-```
-
-它不是简单的帧号，因此不能直接靠文件名恢复时序。  
-必须通过 `db` 中的：
-
-- `image`
-- `camera`
-- `ego_pose`
-
-三张表做对齐。
-
----
-
-## 4. 第一版任务定义
-
-### 4.1 输入
-
-- 历史图像：
-  - 默认取 `CAM_F0`
-  - 默认取连续 `4` 帧
-- 当前 ego 状态：
-  - 当前速度
-  - 当前航向
-  - 当前加速度
-  - 当前角速度
-- 候选未来轨迹：
-  - 默认 `8` 步
-  - 每步是 `(dx, dy, dyaw)`
-  - 默认采样间隔 `0.5s`
-
-### 4.2 输出
-
-- 一个二分类 logit
-- 训练时对应 `label in {0, 1}`
-
-### 4.3 正负样本
-
-正样本：
-
-- 当前历史图像
-- 当前 ego 状态
-- 当前时刻真实 future trajectory
-- `label = 1`
-
-负样本：
-
-- 当前历史图像不变
-- ego 状态不变
-- 从同一 split 中随机取另一条候选 future trajectory
-- `label = 0`
-
-这是第一版最简单的 critic 构造方法，便于先跑通训练链路。
-
----
-
-## 5. 当前模型结构 - 多维度评估
-
-`train.py` 中包含两个版本的模型：
-
-### 5.1 基础 Critic 模型（CriticModel）
-- `SimpleImageEncoder`
-  - 对历史图像逐帧编码
-  - 再做时间维平均
-- `TrajectoryEncoder`
-  - 对未来轨迹展平后做 MLP 编码
-- `ego encoder`
-  - 对 ego 状态做 MLP 编码
-- `head`
-  - 拼接三类特征
-  - 输出一个二分类分数
-
-### 5.2 多维度 Consistency Critic 模型（ConsistencyCriticModel）
-
-**共享 Backbone**：
-- History/Future Image Encoder（共享CNN，独立投影）
-- Trajectory Encoder
-- Ego Encoder
-
-**多维度评估头**：
-- `consistency_head`: overall consistency（总体一致性）
-- `speed_consistency_head`: speed consistency（速度一致性）
-- `steering_consistency_head`: steering consistency（转向一致性）
-- `progress_consistency_head`: progress consistency（前进一致性）
-- `temporal_coherence_head`: temporal coherence（时间连贯性）
-- `validity_head`: driving validity（驾驶合理性）
-
-**训练 Loss**：
-```
-L = λ_c * L_consistency + λ_v * L_validity
-  + λ_speed * L_speed + λ_steering * L_steering
-  + λ_progress * L_progress + λ_temporal * L_temporal
-```
-
-这是多维度评估版本，后续可以替换成更强 backbone 或 ranking loss。
-
----
-
-## 5.1 Ranking 评估能力
-
-除了基础的分类准确率，模型还需要具备良好的排序能力：
-
-**评估指标**：
-- `NDCG@3`, `NDCG@5`: 归一化折扣累积增益
-- `MRR`: 平均倒数排名
-- `Top-1 Hit Rate`: 最佳候选命中率
-
-**评估方法**：
+**相机图像目录**：
 ```bash
-python eval_critic.py --checkpoint work_dirs/consistency_mini_v2/checkpoints/best.pth --eval-ranking
+/mnt/cpfs/prediction/lipeinan/nuplan_data/mini_set/
+├── nuplan-v1.1_mini_camera_0/
+└── nuplan-v1.1_mini_camera_1/
 ```
 
----
+#### 1.2 为什么需要 DB 文件
 
-## 6. 配置文件说明
+图像文件名是 token（如 `14fffca1394c537d.jpg`），无法直接从文件名推断时序关系。必须通过 DB 中的三张表对齐：
+- `image` 表：图像元数据
+- `camera` 表：相机通道信息
+- `ego_pose` 表：车辆位姿
 
-配置文件位于：
+### 2. 索引构建
 
-```text
-/mnt/cpfs/prediction/lipeinan/nuplan/configs/train_critic_mini.py
+索引构建是将原始数据转换为训练可用的样本格式：
+
+```bash
+# 构建基础 critic 索引
+python tools/build_critic_index.py
+
+# 构建多维度一致性 critic 索引
+python tools/build_consistency_index.py
+
+# 调试模式（仅构建少量样本）
+python tools/build_critic_index.py --max-scenes 2 --max-samples-per-scene 20
 ```
 
-其中重要字段包括：
-
-- `train_index`
-  - 训练索引路径
-- `val_index`
-  - 验证索引路径
-- `image_root`
-  - 图片根目录
-- `mini_db_root`
-  - mini split db 路径
-- `camera_roots`
-  - 当前已解压的相机包目录
-- `camera_channel`
-  - 当前使用的相机，默认 `CAM_F0`
-- `history_num_frames`
-  - 历史帧数，默认 `4`
-- `candidate_traj_steps`
-  - future 轨迹步数，默认 `8`
-- `future_step_time_s`
-  - future 轨迹采样时间间隔，默认 `0.5`
-- `epochs`
-  - 默认训练 epoch
-- `batch_size`
-  - 每卡 batch size
-- `num_workers`
-  - dataloader worker 数
-
----
-
-## 7. 索引文件格式
-
-训练和验证集最终读取的是 `jsonl` 文件。
-
-每条样本最少包含：
-
+**输出格式**（JSONL，每行一个样本）：
 ```json
 {
   "sample_id": "2021.05.25.14.16.10_veh-35_01690_02183__1621968321487272__pos",
   "scene_name": "2021.05.25.14.16.10_veh-35_01690_02183",
   "timestamp_us": 1621968321487272,
   "history_images": [
-    "nuplan-v1.1_mini_camera_0/2021.05.25.14.16.10_veh-35_01690_02183/CAM_F0/xxxx.jpg",
-    "nuplan-v1.1_mini_camera_0/2021.05.25.14.16.10_veh-35_01690_02183/CAM_F0/yyyy.jpg"
+    "nuplan-v1.1_mini_camera_0/.../CAM_F0/xxxx.jpg",
+    "nuplan-v1.1_mini_camera_0/.../CAM_F0/yyyy.jpg"
   ],
   "ego_state": [vx, vy, yaw, acceleration_x, angular_rate_z],
-  "candidate_traj": [
-    [dx1, dy1, dyaw1],
-    [dx2, dy2, dyaw2]
-  ],
+  "candidate_traj": [[dx1, dy1, dyaw1], [dx2, dy2, dyaw2], ...],
   "label": 1
 }
 ```
 
-负样本格式相同，只是：
+**正负样本策略**：
+- **正样本**：历史图像 + 真实未来轨迹 → label=1
+- **负样本**：历史图像 + 随机错配轨迹 → label=0
 
-- `candidate_traj` 换成错配轨迹
-- `label = 0`
+### 3. 模型训练
 
----
-
-## 8. 如何重新生成索引
-
-当前索引由这个脚本生成：
-
-```text
-/mnt/cpfs/prediction/lipeinan/nuplan/tools/build_critic_index.py
-```
-
-### 8.1 默认生成
+#### 3.1 本地训练
 
 ```bash
-cd /mnt/cpfs/prediction/lipeinan/nuplan
-python tools/build_critic_index.py
-```
-
-生成结果会写到：
-
-```text
-/mnt/cpfs/prediction/lipeinan/nuplan/indices/
-```
-
-包括：
-
-- `critic_train.jsonl`
-- `critic_val.jsonl`
-- `critic_index_summary.json`
-
-### 8.2 调试模式
-
-如果只想抽少量场景快速验证：
-
-```bash
-python tools/build_critic_index.py --max-scenes 2 --max-samples-per-scene 20
-```
-
-### 8.3 常见可调参数
-
-- `--camera-channel`
-  - 默认 `CAM_F0`
-- `--history-num-frames`
-  - 默认 `4`
-- `--future-steps`
-  - 默认 `8`
-- `--future-step-time-s`
-  - 默认 `0.5`
-- `--sample-stride`
-  - 默认 `5`
-- `--val-ratio`
-  - 默认 `0.2`
-
----
-
-## 9. 本地训练方法
-
-### 9.1 正常训练
-
-```bash
-cd /mnt/cpfs/prediction/lipeinan/nuplan
+# 标准训练
 python train.py --config configs/train_critic_mini.py
-```
 
-### 9.2 覆盖 work_dir
+# 自定义工作目录
+python train.py --config configs/train_critic_mini.py --work-dir ./work_dirs/exp1
 
-```bash
-python train.py \
-  --config configs/train_critic_mini.py \
-  --work-dir ./work_dirs/critic_exp1
-```
-
-### 9.3 调试冒烟测试
-
-```bash
+# 调试模式（快速验证）
 python train.py \
   --config configs/train_critic_mini.py \
   --work-dir ./work_dirs/smoke_test \
@@ -403,150 +188,325 @@ python train.py \
   --max-val-steps 2
 ```
 
----
-
-## 10. DLC 平台训练方法
-
-当前 DLC 启动脚本：
-
-```text
-/mnt/cpfs/prediction/lipeinan/nuplan/dlc_train.sh
-```
-
-### 10.1 平台固定入口
+#### 3.2 DLC 分布式训练
 
 ```bash
-cd /mnt/cpfs/prediction/lipeinan/nuplan
-bash dlc_train.sh
+# 默认配置
+bash scripts/dlc_train.sh
+
+# 自定义参数
+bash scripts/dlc_train.sh --batch-size 16 --epochs 20 --work-dir ./work_dirs/critic_bs16
 ```
 
-### 10.2 覆盖部分训练参数
+**分布式训练特性**：
+- 自动读取 DLC 注入的环境变量（RANK、WORLD_SIZE、LOCAL_RANK）
+- 使用 `torch.distributed.run` 启动多进程
+- 支持多机多卡训练（timeout=30分钟）
+
+#### 3.3 训练输出
+
+每次训练会在 `work_dirs/{experiment_name}/` 下生成：
+```
+work_dirs/critic_mini_v1/
+├── checkpoints/
+│   ├── latest.pth          # 最新检查点
+│   └── best.pth            # 验证集最优检查点
+├── config_snapshot.json    # 配置快照（用于复现）
+└── eval_val_results.json   # 验证集评估结果
+```
+
+### 4. 模型评估
 
 ```bash
-cd /mnt/cpfs/prediction/lipeinan/nuplan
-bash dlc_train.sh --batch-size 16 --epochs 20 --work-dir ./work_dirs/critic_bs16
+# 基础评估（准确率）
+python eval_critic.py --checkpoint work_dirs/critic_mini_v1/checkpoints/best.pth
+
+# Ranking 评估
+python eval_critic.py \
+  --checkpoint work_dirs/consistency_mini_v1/checkpoints/best.pth \
+  --eval-ranking
 ```
 
-### 10.3 脚本做了什么
+**评估指标**：
+- **分类准确率**：判断正负样本的准确性
+- **NDCG@3/5**：归一化折扣累积增益
+- **MRR**：平均倒数排名
+- **Top-1 Hit Rate**：最佳候选命中率
 
-`dlc_train.sh` 会：
+### 5. 未来图像生成（扩展功能）
 
-- 读取 DLC 注入的多机分布式环境变量
-- 自动推断单机 GPU 数
-- 使用 `torch.distributed.run` 启动训练
-- 调用：
+集成 World Model 生成未来图像：
 
-```text
-train.py --config configs/train_critic_mini.py
+```bash
+# 使用 DrivingWorld 生成
+python generate_futures_drivingworld.py \
+  --checkpoint /path/to/drivingworld_ckpt.pth \
+  --input-data /path/to/input.jsonl \
+  --output-dir ./generated_data
+```
+
+**生成数据用途**：
+- 计算 FID/FVD 指标（生成质量评估）
+- 构建生成图像数据集
+- 用于后续一致性评估
+
+### 6. 闭环评估（开发中）
+
+```bash
+# 闭环性能评估
+python closed_loop_evaluation.py \
+  --critic-checkpoint work_dirs/critic_mini_v1/checkpoints/best.pth \
+  --scenarios /path/to/scenarios
+```
+
+**评估目标**：
+- Critic score 与 nuPlan 闭环性能的相关性
+- 对比传统 FID/FVD 指标的相关性
+
+---
+
+## 模型架构
+
+### 基础 Critic 模型
+
+```
+历史图像 (4帧) ──► SimpleImageEncoder ──┐
+                                         ├──► Concat ──► Head ──► Score
+候选未来轨迹 ──► TrajectoryEncoder ─────┤
+                                         │
+Ego 状态 ──────► EgoEncoder ────────────┘
+```
+
+**组件说明**：
+- **SimpleImageEncoder**：对历史图像逐帧编码（CNN），时间维度平均池化
+- **TrajectoryEncoder**：未来轨迹展平后通过 MLP 编码
+- **EgoEncoder**：Ego 状态通过 MLP 编码
+- **Head**：拼接三类特征，输出二分类 logit
+
+### 多维度 Consistency Critic 模型
+
+```
+                    ┌─► Consistency Head ───► L_consistency
+                    ├─► Speed Head ─────────► L_speed
+历史图像 ──┐        ├─► Steering Head ──────► L_steering
+           ├─► Shared Backend ──┤
+未来图像 ──┘        ├─► Progress Head ──────► L_progress
+                    ├─► Temporal Head ──────► L_temporal
+                    └─► Validity Head ──────► L_validity
+
+候选轨迹 ──► Traj Encoder ──┘
+Ego 状态 ──► Ego Encoder ───┘
+```
+
+**多维度评估头**：
+1. **consistency_head**：总体一致性
+2. **speed_consistency_head**：速度一致性
+3. **steering_consistency_head**：转向一致性
+4. **progress_consistency_head**：前进一致性
+5. **temporal_coherence_head**：时间连贯性
+6. **validity_head**：驾驶合理性
+
+**损失函数**：
+```
+L = λ_c * L_consistency + λ_v * L_validity
+  + λ_speed * L_speed + λ_steering * L_steering
+  + λ_progress * L_progress + λ_temporal * L_temporal
 ```
 
 ---
 
-## 11. 当前已验证通过的内容
+## 配置参数说明
 
-当前已验证：
+### 核心配置项（configs/train_critic_mini.py）
 
-- `dlc_train.sh` shell 语法通过
-- `train.py` Python 语法通过
-- `build_critic_index.py` Python 语法通过
-- lints 检查通过
-- mini 场景索引可以正确生成
-- 训练链路 smoke test 成功跑通
-
-当前索引摘要见：
-
-```text
-/mnt/cpfs/prediction/lipeinan/nuplan/indices/critic_index_summary.json
+```python
+cfg = dict(
+    # 实验配置
+    experiment_name="nuplan_critic_mini_v1",  # 实验名称
+    seed=42,                                   # 随机种子
+    work_dir="./work_dirs/critic_mini_v1",    # 输出目录
+    
+    # 数据路径
+    train_index="indices/critic_train.jsonl",  # 训练索引
+    val_index="indices/critic_val.jsonl",      # 验证索引
+    image_root="/path/to/nuplan_data/mini_set", # 图像根目录
+    mini_db_root="/path/to/mini/db",           # DB 文件目录
+    camera_roots=[...],                         # 相机数据目录列表
+    
+    # 数据参数
+    camera_channel="CAM_F0",                   # 使用的相机通道
+    history_num_frames=4,                      # 历史帧数
+    candidate_traj_steps=8,                    # 未来轨迹步数
+    future_step_time_s=0.5,                    # 轨迹采样间隔（秒）
+    image_size=224,                            # 图像尺寸
+    
+    # 训练参数
+    epochs=10,                                 # 训练轮数
+    batch_size=8,                              # 每卡 batch size
+    num_workers=4,                             # DataLoader worker 数
+    log_interval=20,                           # 日志打印间隔
+    val_interval=1,                            # 验证间隔（epoch）
+    save_interval=1,                           # 保存间隔（epoch）
+    
+    # 优化器
+    optimizer=dict(
+        lr=1e-4,                               # 学习率
+        weight_decay=1e-2,                     # 权重衰减
+    ),
+    
+    # 模型参数
+    model=dict(
+        image_channels=3,
+        image_feature_dim=256,
+        action_feature_dim=128,
+        hidden_dim=256,
+        dropout=0.1,
+    ),
+    
+    # 数据集参数
+    dataset=dict(
+        normalize_ego_state=True,              # 是否归一化 ego 状态
+        normalize_candidate_traj=True,         # 是否归一化轨迹
+        image_mean=[0.485, 0.456, 0.406],     # 图像归一化均值
+        image_std=[0.229, 0.224, 0.224],      # 图像归一化标准差
+    ),
+)
 ```
 
 ---
 
-## 12. 当前版本的局限
+## 快速开始
 
-这仍然是第一版骨架，不是最终完整版。
+### 环境要求
 
-当前限制：
+- Python >= 3.8
+- PyTorch >= 1.10
+- CUDA >= 11.0（GPU 训练）
 
-- 只使用 `CAM_F0`
-- 只使用历史图像，不使用 future image（基础版）
-- 负样本仍较简单
-- 模型 backbone 仍较轻量
-- 没有专门的 evaluator / ranking 指标（基础版）
-- **尚未与闭环性能验证**（这是最终目标）
+### 5 分钟上手
+
+```bash
+# 1. 构建索引（调试模式）
+python tools/build_critic_index.py --max-scenes 2 --max-samples-per-scene 20
+
+# 2. 运行冒烟测试
+python train.py \
+  --config configs/train_critic_mini.py \
+  --work-dir ./work_dirs/smoke_test \
+  --epochs 1 \
+  --batch-size 2 \
+  --num-workers 0 \
+  --max-train-steps 3 \
+  --max-val-steps 2
+
+# 3. 查看结果
+ls -lh work_dirs/smoke_test/checkpoints/
+```
 
 ---
 
-## 13. 下一步建议 - 三层评估框架
+## 扩展与定制
 
-### Phase 1: 强化当前 Critic（当前已完成）
+### 更换 Backbone
 
-✅ 多维度评估头（speed, steering, progress, temporal）
-✅ Ranking 评估能力（NDCG, MRR, Top-1 Hit Rate）
-✅ 细粒度负样本构造
+修改 `train.py` 中的模型定义，替换为更强的图像编码器（如 ResNet-50、ViT 等）。
 
-### Phase 2: 集成 World Model（待实现）
+### 多相机输入
 
-- [ ] 集成 DrivingWorld 或其他 world model
-- [ ] 实现图像生成 pipeline
-- [ ] 添加 FID/FVD 计算（Layer 1: 生成质量）
-- [ ] 构建生成图像数据集
+在配置文件中修改：
+```python
+camera_channel = ["CAM_F0", "CAM_L0", "CAM_R0"]  # 使用多个相机
+history_num_frames = 4                            # 每个相机的历史帧数
+```
 
-### Phase 3: 逆动力学一致性（待实现）
+### 自定义负样本策略
 
-- [ ] 训练/集成 inverse dynamics model
-- [ ] 实现：生成图像 → 反推 action → 与条件比较
-- [ ] 多维度 recoverability 指标（Layer 2: Action一致性）
+修改 `tools/build_critic_index.py` 中的负样本生成逻辑：
+- 难负样本：选择相似的错误轨迹
+- 课程学习：逐步增加负样本难度
 
-### Phase 4: 闭环性能验证（核心目标）
+### 集成其他 World Model
 
-- [ ] 集成 nuPlan closed-loop simulator
-- [ ] 构建 critic-guided planning pipeline
-- [ ] 设计相关性实验：
-  - 计算 critic score vs closed-loop performance 的相关性
-  - 计算 FID/FVD vs closed-loop performance 的相关性
-  - **假设**：critic score 的相关性 > FID/FVD 的相关性
-- [ ] 证明 visual-action metric 更能预测驾驶性能（Layer 3: 驾驶有用性）
-
-### Phase 5: Model Rollout 适配
-
-- [ ] 收集 DrivingWorld rollout 数据
-- [ ] 两阶段训练：GT pretrain → model finetune
-- [ ] 验证 domain gap 缩小
+在 `generation/` 目录下添加新的 wrapper：
+```python
+# generation/my_world_model_wrapper.py
+class MyWorldModelWrapper:
+    def generate(self, ...):
+        # 实现生成逻辑
+        pass
+```
 
 ---
 
-## 14. 一句话总结
+## 常见问题
 
-当前这套工程已经具备：
+### Q: 为什么必须使用 DB 文件？
 
-- `mini_set 图片 + mini db -> 训练索引`
-- `训练索引 -> 多维度 critic 训练`（consistency, speed, steering, progress, temporal, validity）
-- `本地训练 + DLC 分布式训练入口`
-- `Ranking 评估能力`（NDCG, MRR, Top-1 Hit Rate）
+A: 图像文件名是随机 token，无法推断时序。DB 文件提供了图像、相机、位姿的关联关系。
 
-也就是说，**Phase 1 已经到达“可以正式开始训练”的状态**。
+### Q: 如何加快索引构建速度？
 
-下一步核心目标：**证明所提 visual-action metric 与 nuPlan 闭环性能的相关性高于传统 FID/FVD**。
+A: 使用 `--max-scenes` 和 `--max-samples-per-scene` 参数限制样本数量。
+
+### Q: 训练时显存不足怎么办？
+
+A: 减小 `batch_size` 或 `history_num_frames`，或使用梯度累积。
+
+### Q: 如何恢复训练？
+
+A: 修改配置文件中的 `work_dir`，在 `train.py` 中添加 checkpoint 加载逻辑。
+
+### Q: 评估指标很低怎么办？
+
+A: 
+- 检查数据质量（索引文件是否正确）
+- 增加训练轮数
+- 调整学习率
+- 使用更强的 backbone
 
 ---
 
-## 15. 核心贡献点
+## 技术栈
 
-如果能证明：
+- **深度学习框架**：PyTorch
+- **分布式训练**：torch.distributed (NCCL)
+- **数据处理**：PIL, NumPy
+- **配置管理**：Python 字典配置
+- **实验管理**：自定义 work_dirs 结构
 
-```
-Proposed Visual-Action Metric ⊨ nuPlan Closed-Loop Performance
-```
+---
 
-比 FID/FVD 更能预测驾驶性能，这就是一个 **strong contribution**：
+## 开发计划
 
-**标题示例**：
-> "Beyond FID: Action-Consistent Evaluation for Driving World Models"
+### Phase 1: 基础 Critic（已完成 ✅）
+- [x] 单相机输入（CAM_F0）
+- [x] 多维度评估头
+- [x] Ranking 评估能力
+- [x] 本地 + 分布式训练支持
 
-**论文叙事**：
-```
-Problem: FID/FVD 不能反映 driving usefulness
-Method: Action-conditioned consequence evaluator
-Key Finding: Our metric correlates with closed-loop performance (ρ=0.XX)
-Impact: Better evaluation criterion for driving world models
-```
+### Phase 2: World Model 集成（开发中）
+- [ ] DrivingWorld 完整集成
+- [ ] 图像生成 pipeline
+- [ ] FID/FVD 计算
+
+### Phase 3: 闭环验证（规划中）
+- [ ] nuPlan closed-loop simulator 集成
+- [ ] Critic-guided planning
+- [ ] 相关性分析实验
+
+### Phase 4: 生产部署（规划中）
+- [ ] 性能优化
+- [ ] 多相机多模态
+- [ ] 在线评估接口
+
+---
+
+## 许可与引用
+
+本项目基于 nuPlan 数据集开发，请遵守 nuPlan 的数据使用协议。
+
+---
+
+## 联系方式
+
+如有问题或建议，请提交 Issue 或联系项目维护者。
