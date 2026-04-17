@@ -1,0 +1,8 @@
+加载 checkpoint: work_dirs/critic_full/checkpoints/best.pth
+Checkpoint 信息: epoch=20, best_val_loss=1.1275742981110055
+模型类型: consistency
+模型加载完成，设备: cuda
+数据集: val (/mnt/cpfs/prediction/lipeinan/nuplan/indices/consistency_val.jsonl)
+样本总数: 10384
+
+开始评估...

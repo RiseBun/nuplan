@@ -1,0 +1,66 @@
+{
+  "experiment_name": "nuplan_consistency_mini_v1",
+  "model_type": "consistency",
+  "seed": 42,
+  "work_dir": "/mnt/cpfs/prediction/lipeinan/nuplan/work_dirs/consistency_mini_v1",
+  "train_index": "/mnt/cpfs/prediction/lipeinan/nuplan/indices/consistency_train.jsonl",
+  "val_index": "/mnt/cpfs/prediction/lipeinan/nuplan/indices/consistency_val.jsonl",
+  "image_root": "/mnt/cpfs/prediction/lipeinan/nuplan_data/mini_set",
+  "mini_db_root": "/mnt/datasets/e2e-datasets/20260227/e2e-datasets/dataset_pkgs/nuplan-v1.1/splits/mini",
+  "camera_roots": [
+    "/mnt/cpfs/prediction/lipeinan/nuplan_data/mini_set/nuplan-v1.1_mini_camera_0",
+    "/mnt/cpfs/prediction/lipeinan/nuplan_data/mini_set/nuplan-v1.1_mini_camera_1"
+  ],
+  "camera_channel": "CAM_F0",
+  "log_interval": 20,
+  "val_interval": 1,
+  "save_interval": 1,
+  "epochs": 30,
+  "batch_size": 8,
+  "num_workers": 4,
+  "image_size": 224,
+  "history_num_frames": 4,
+  "future_num_frames": 4,
+  "candidate_traj_steps": 8,
+  "future_step_time_s": 0.5,
+  "ego_state_dim": 5,
+  "traj_dim": 3,
+  "lambda_consistency": 1.0,
+  "lambda_validity": 0.5,
+  "positive_weight": 1.0,
+  "consistency_positive_weight": 3.0,
+  "validity_positive_weight": 1.0,
+  "optimizer": {
+    "lr": 0.0001,
+    "weight_decay": 0.01
+  },
+  "model": {
+    "image_channels": 3,
+    "image_feature_dim": 256,
+    "action_feature_dim": 128,
+    "hidden_dim": 256,
+    "fusion_dim": 256,
+    "dropout": 0.1
+  },
+  "dataset": {
+    "normalize_ego_state": true,
+    "normalize_candidate_traj": true,
+    "normalize_mode": "linear",
+    "traj_scale": [
+      60.0,
+      25.0,
+      2.0
+    ],
+    "image_mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "image_std": [
+      0.229,
+      0.224,
+      0.225
+    ]
+  },
+  "_config_path": "/mnt/cpfs/prediction/lipeinan/nuplan/configs/train_consistency_mini.py"
+}

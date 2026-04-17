@@ -1,0 +1,64 @@
+{
+  "camera_channel": "CAM_F0",
+  "history_num_frames": 4,
+  "future_image_offsets": [
+    0.5,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "future_steps": 8,
+  "future_step_time_s": 0.5,
+  "sample_stride": 5,
+  "perturb_lateral_range": [
+    0.5,
+    2.0
+  ],
+  "perturb_heading_range": [
+    5.0,
+    15.0
+  ],
+  "perturb_speed_range": [
+    0.7,
+    1.3
+  ],
+  "train_scenes": [
+    "2021.05.12.22.00.38_veh-35_01008_01518",
+    "2021.05.12.22.28.35_veh-35_00620_01164",
+    "2021.05.12.23.36.44_veh-35_00152_00504",
+    "2021.05.12.23.36.44_veh-35_01133_01535",
+    "2021.05.12.23.36.44_veh-35_02035_02387",
+    "2021.05.25.14.16.10_veh-35_01690_02183",
+    "2021.06.03.12.02.06_veh-35_00233_00609",
+    "2021.06.07.18.53.26_veh-26_00005_00427",
+    "2021.06.08.12.54.54_veh-26_04262_04732",
+    "2021.06.08.14.35.24_veh-26_02555_03004",
+    "2021.06.09.11.54.15_veh-12_04366_04810"
+  ],
+  "val_scenes": [
+    "2021.06.03.13.55.17_veh-35_00073_00426",
+    "2021.06.07.12.54.00_veh-35_01843_02314",
+    "2021.06.08.16.31.33_veh-38_01589_02072"
+  ],
+  "num_train_anchors": 9559,
+  "num_val_anchors": 2596,
+  "num_train_rows": 38236,
+  "num_val_rows": 10384,
+  "train_source_types": {
+    "perturb_lateral": 3252,
+    "image_swap": 9559,
+    "gt_pos": 9559,
+    "perturb_speed": 3081,
+    "traj_swap": 9559,
+    "perturb_heading": 3226
+  },
+  "val_source_types": {
+    "perturb_lateral": 877,
+    "traj_swap": 2596,
+    "gt_pos": 2596,
+    "perturb_heading": 843,
+    "image_swap": 2596,
+    "perturb_speed": 876
+  },
+  "skipped_scenes": {}
+}
