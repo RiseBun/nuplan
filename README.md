@@ -233,7 +233,7 @@ python eval_critic.py \
 - **MRR**：平均倒数排名
 - **Top-1 Hit Rate**：最佳候选命中率
 
-### 5. 未来图像生成（扩展功能）
+### 5. 未来图像生成（扩展）
 
 集成 World Model 生成未来图像：
 
@@ -250,7 +250,7 @@ python generate_futures_drivingworld.py \
 - 构建生成图像数据集
 - 用于后续一致性评估
 
-### 6. 闭环评估（开发中）
+### 6. 闭环评估
 
 ```bash
 # 闭环性能评估
