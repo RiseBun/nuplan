@@ -476,34 +476,7 @@ A:
 
 ---
 
-## 开发计划
 
-### Phase 1: 基础 Critic（已完成 ✅）
-- [x] 单相机输入（CAM_F0）
-- [x] 多维度评估头
-- [x] Ranking 评估能力
-- [x] 本地 + 分布式训练支持
-
-### Phase 2: World Model 集成（开发中）
-- [ ] DrivingWorld 完整集成
-- [ ] 图像生成 pipeline
-- [ ] FID/FVD 计算
-
-### Phase 3: 闭环验证（规划中）
-- [ ] nuPlan closed-loop simulator 集成
-- [ ] Critic-guided planning
-- [ ] 相关性分析实验
-
-### Phase 4: 生产部署（规划中）
-- [ ] 性能优化
-- [ ] 多相机多模态
-- [ ] 在线评估接口
-
----
-
-## 许可与引用
-
-本项目基于 nuPlan 数据集开发，请遵守 nuPlan 的数据使用协议。
 
 ---
 
