@@ -34,7 +34,7 @@ export NCCL_TIMEOUT=1800
 ###################################
 # User Configuration Section
 ###################################
-PYTHON_PATH="/root/anaconda3/envs/flow_planner/bin/python"
+PYTHON_BIN="${IAC_PYTHON_BIN:-/root/miniconda3/bin/python}"
 # Get project root relative to script location (scripts/ -> project root)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -72,6 +72,12 @@ fi
 cd ${PROJECT_ROOT}
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 
+if [ ! -x "$PYTHON_BIN" ]; then
+    echo "Error: Python executable not found: $PYTHON_BIN"
+    echo "Set IAC_PYTHON_BIN to the Python executable for this environment."
+    exit 1
+fi
+
 # 提高文件描述符限制，避免多 worker 数据加载时 ancdata 错误
 ulimit -n 65536 2>/dev/null || echo "Warning: Could not set ulimit to 65536, using default"
 
@@ -93,7 +99,7 @@ echo "Project Configuration:"
 echo "  Project root: $PROJECT_ROOT"
 echo "  Config file: $CONFIG_FILE"
 echo "  Train script: $TRAIN_SCRIPT"
-echo "  Python: $PYTHON_PATH"
+echo "  Python: $PYTHON_BIN"
 echo "==================================="
 
 ###################################
@@ -115,7 +121,8 @@ fi
 echo ""
 echo "Checking training data..."
 
-INDEX_DIR="${PROJECT_ROOT}/indices"
+INDEX_DIR="${NUPLAN_INDEX_ROOT:-${PROJECT_ROOT}/indices_v3}"
+export NUPLAN_INDEX_ROOT="$INDEX_DIR"
 TRAIN_INDEX="${INDEX_DIR}/consistency_train.jsonl"
 VAL_INDEX="${INDEX_DIR}/consistency_val.jsonl"
 
@@ -127,9 +134,15 @@ if [ ! -f "$TRAIN_INDEX" ] || [ ! -f "$VAL_INDEX" ]; then
     echo "Building fresh IAC index from nuPlan DB and camera images..."
     echo ""
     
-    DATA_ROOT="${NUPLAN_DATA_ROOT:-${PROJECT_ROOT}/data/mini_set}"
-    DB_ROOT="${NUPLAN_DB_ROOT:-${PROJECT_ROOT}/data/nuplan-v1.1/splits/mini}"
-    CAMERA_ROOTS="${NUPLAN_CAMERA_ROOTS:-${DATA_ROOT}/nuplan-v1.1_mini_camera_0 ${DATA_ROOT}/nuplan-v1.1_mini_camera_1}"
+    DATA_ROOT="${NUPLAN_DATA_ROOT:-${PROJECT_ROOT}/..}"
+    DB_ROOT="${NUPLAN_DB_ROOT:-${DATA_ROOT}/data/cache/mini}"
+    mapfile -t CAMERA_ROOTS < <(
+        "$PYTHON_BIN" - <<'PY'
+from data_paths import camera_roots
+for path in camera_roots():
+    print(path)
+PY
+    )
 
     if [ ! -d "$DB_ROOT" ]; then
         echo "Error: NuPlan DB root not found: $DB_ROOT"
@@ -138,14 +151,13 @@ if [ ! -f "$TRAIN_INDEX" ] || [ ! -f "$VAL_INDEX" ]; then
     fi
 
     echo "  DB root: $DB_ROOT"
-    echo "  Camera roots: $CAMERA_ROOTS"
+    echo "  Camera roots: ${CAMERA_ROOTS[*]}"
     echo "  Output: $INDEX_DIR"
     echo ""
     mkdir -p "$INDEX_DIR"
-    # shellcheck disable=SC2086
-    $PYTHON_PATH tools/build_consistency_index.py \
+    "$PYTHON_BIN" tools/build_consistency_index.py \
         --db-root "$DB_ROOT" \
-        --image-roots $CAMERA_ROOTS \
+        --image-roots "${CAMERA_ROOTS[@]}" \
         --output-dir "$INDEX_DIR"
     
     if [ $? -ne 0 ]; then
@@ -226,7 +238,7 @@ echo ""
 ###################################
 echo "Starting distributed training..."
 
-$PYTHON_PATH -m torch.distributed.run \
+"$PYTHON_BIN" -m torch.distributed.run \
     --nnodes=$NNODES \
     --nproc_per_node=$NPROC_PER_NODE \
     --node_rank=$NODE_RANK \

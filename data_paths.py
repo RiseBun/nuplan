@@ -36,7 +36,7 @@ DB_ROOT = _path_from_env(
     "NUPLAN_DB_ROOT",
     WORKSPACE_ROOT / "data" / "cache" / "mini",
 )
-INDEX_ROOT = _path_from_env("NUPLAN_INDEX_ROOT", PROJECT_ROOT / "indices")
+INDEX_ROOT = _path_from_env("NUPLAN_INDEX_ROOT", PROJECT_ROOT / "indices_v3")
 GENERATED_DATA_ROOT = _path_from_env(
     "NUPLAN_GENERATED_DATA_ROOT",
     PROJECT_ROOT / "generated_data",
@@ -60,6 +60,10 @@ def camera_roots(data_root: Path = DATA_ROOT) -> List[Path]:
             roots.append(Path(cam1).expanduser())
         return roots
 
+    discovered = sorted(data_root.glob("nuplan-v1.1_mini_camera_*"))
+    if discovered:
+        return [path for path in discovered if path.is_dir()]
+
     return [
         data_root / "nuplan-v1.1_mini_camera_0",
         data_root / "nuplan-v1.1_mini_camera_1",
@@ -68,4 +72,3 @@ def camera_roots(data_root: Path = DATA_ROOT) -> List[Path]:
 
 def path_str(path: Path) -> str:
     return str(path)
-

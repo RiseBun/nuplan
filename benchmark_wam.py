@@ -51,6 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default=None)
     parser.add_argument("--group-key", default="group_id", help="Group key for candidate ranking")
     parser.add_argument("--wam-key", default="wam_name", help="Field identifying the WAM/model")
+    parser.add_argument(
+        "--consistency-threshold",
+        type=float,
+        default=None,
+        help="Optional calibrated threshold for consistency pass/fail. Continuous score is always emitted.",
+    )
+    parser.add_argument(
+        "--validity-threshold",
+        type=float,
+        default=None,
+        help="Optional calibrated threshold for validity pass/fail.",
+    )
     return parser.parse_args()
 
 
@@ -252,7 +264,13 @@ def _ranking_summary(scored: List[Dict[str, Any]], group_key: str) -> Dict[str, 
     }
 
 
-def _summary(scored: List[Dict[str, Any]], wam_key: str, group_key: str) -> Dict[str, Any]:
+def _summary(
+    scored: List[Dict[str, Any]],
+    wam_key: str,
+    group_key: str,
+    consistency_threshold: float | None,
+    validity_threshold: float | None,
+) -> Dict[str, Any]:
     c_labels = [row.get("consistency_label") for row in scored]
     v_labels = [row.get("validity_label") for row in scored]
     c_scores = torch.tensor([row["iac_consistency"] for row in scored], dtype=torch.float32)
@@ -263,6 +281,10 @@ def _summary(scored: List[Dict[str, Any]], wam_key: str, group_key: str) -> Dict
         "overall": {
             "mean_consistency": float(c_scores.mean().item()),
             "mean_validity": float(v_scores.mean().item()),
+        },
+        "thresholds": {
+            "consistency_threshold": consistency_threshold,
+            "validity_threshold": validity_threshold,
         },
         "by_wam": {},
         "by_action_type": {},
@@ -290,6 +312,23 @@ def _summary(scored: List[Dict[str, Any]], wam_key: str, group_key: str) -> Dict
                 "mean_consistency": _mean(row["iac_consistency"] for row in rows),
                 "mean_validity": _mean(row["iac_validity"] for row in rows),
             }
+            if consistency_threshold is not None:
+                summary[output_key][value]["consistency_pass_rate"] = _mean(
+                    float(row["consistency_pass"]) for row in rows
+                )
+            if validity_threshold is not None:
+                summary[output_key][value]["validity_pass_rate"] = _mean(
+                    float(row["validity_pass"]) for row in rows
+                )
+
+    if consistency_threshold is not None:
+        summary["overall"]["consistency_pass_rate"] = _mean(
+            float(row["consistency_pass"]) for row in scored
+        )
+    if validity_threshold is not None:
+        summary["overall"]["validity_pass_rate"] = _mean(
+            float(row["validity_pass"]) for row in scored
+        )
 
     graded: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for row in scored:
@@ -336,6 +375,12 @@ def main() -> None:
                 row = dict(rows[offset + i])
                 row["iac_consistency"] = float(c_score)
                 row["iac_validity"] = float(v_score)
+                if args.consistency_threshold is not None:
+                    row["consistency_threshold"] = float(args.consistency_threshold)
+                    row["consistency_pass"] = bool(c_score >= args.consistency_threshold)
+                if args.validity_threshold is not None:
+                    row["validity_threshold"] = float(args.validity_threshold)
+                    row["validity_pass"] = bool(v_score >= args.validity_threshold)
                 c_label = _label(row, "consistency_label")
                 v_label = _label(row, "validity_label")
                 if c_label is not None:
@@ -352,7 +397,13 @@ def main() -> None:
         for row in scored:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    summary = _summary(scored, args.wam_key, args.group_key)
+    summary = _summary(
+        scored,
+        args.wam_key,
+        args.group_key,
+        args.consistency_threshold,
+        args.validity_threshold,
+    )
     summary["input"] = str(args.input)
     summary["checkpoint"] = str(args.checkpoint)
     summary_path = out_dir / "wam_iac_summary.json"
@@ -363,10 +414,13 @@ def main() -> None:
     print(f"samples={summary['num_samples']}")
     print(f"mean_consistency={summary['overall']['mean_consistency']:.4f}")
     print(f"mean_validity={summary['overall']['mean_validity']:.4f}")
+    if "consistency_pass_rate" in summary["overall"]:
+        print(f"consistency_pass_rate={summary['overall']['consistency_pass_rate']:.4f}")
+    if "validity_pass_rate" in summary["overall"]:
+        print(f"validity_pass_rate={summary['overall']['validity_pass_rate']:.4f}")
     print(f"scores={scored_path}")
     print(f"summary={summary_path}")
 
 
 if __name__ == "__main__":
     main()
-

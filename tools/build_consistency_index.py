@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
+from PIL import Image
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -71,19 +73,30 @@ def parse_args() -> argparse.Namespace:
     # 扰动参数
     parser.add_argument(
         "--perturb-lateral-range", type=float, nargs=2,
-        default=[0.5, 2.0], help="横向偏移范围 (m)",
+        default=[1.0, 3.5], help="横向偏移范围 (m)，默认使用更可见的扰动降低标签噪声",
     )
     parser.add_argument(
         "--perturb-heading-range", type=float, nargs=2,
-        default=[5.0, 15.0], help="航向扰动范围 (度)",
+        default=[10.0, 25.0], help="航向扰动范围 (度)，默认使用更可见的扰动降低标签噪声",
     )
     parser.add_argument(
         "--perturb-speed-range", type=float, nargs=2,
-        default=[0.7, 1.3], help="速度缩放范围",
+        default=[0.5, 1.6], help="速度缩放范围，默认避开接近 1.0 的弱扰动",
     )
     parser.add_argument(
-        "--time-shift-future-steps", type=int, default=2,
+        "--perturb-policy",
+        choices=["random_one", "all"],
+        default="all",
+        help="每个 anchor 的扰动负样本策略。all 会生成 lateral/heading/speed 三类，利于 ranking。",
+    )
+    parser.add_argument(
+        "--time-shift-future-steps", type=int, default=4,
         help="同一 scene 内 future_images 错位的 anchor 步数，用于 hard negative",
+    )
+    parser.add_argument(
+        "--skip-image-decode-verification",
+        action="store_true",
+        help="跳过索引写入前的图片解码校验。不建议用于正式索引。",
     )
     return parser.parse_args()
 
@@ -163,6 +176,61 @@ def _find_nearest_image_index(
     if best_diff > max_diff_us:
         return -1
     return best_idx
+
+
+def is_usable_image_file(path: Path) -> bool:
+    """快速过滤缺失或空文件；完整解码检查留给训练 preflight。"""
+    try:
+        return path.exists() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def filter_decodable_anchors(
+    scene_anchors: Dict[str, List[ConsistencyAnchor]],
+    image_roots: Sequence[Path],
+) -> Tuple[Dict[str, List[ConsistencyAnchor]], int, List[str]]:
+    """Remove anchors that reference missing, empty, or undecodable images."""
+    root_lookup = {root.name: root.parent for root in image_roots}
+    decode_cache: Dict[str, bool] = {}
+    bad_examples: List[str] = []
+
+    def is_decodable(relative_path: str) -> bool:
+        cached = decode_cache.get(relative_path)
+        if cached is not None:
+            return cached
+        path = Path(relative_path)
+        if not path.is_absolute():
+            if not path.parts or path.parts[0] not in root_lookup:
+                decode_cache[relative_path] = False
+                bad_examples.append(relative_path)
+                return False
+            path = root_lookup[path.parts[0]] / path
+        try:
+            if not is_usable_image_file(path):
+                raise OSError("missing or empty file")
+            with Image.open(path) as image:
+                image.verify()
+            decode_cache[relative_path] = True
+        except Exception as exc:
+            decode_cache[relative_path] = False
+            if len(bad_examples) < 20:
+                bad_examples.append(f"{path} ({type(exc).__name__})")
+        return decode_cache[relative_path]
+
+    filtered: Dict[str, List[ConsistencyAnchor]] = {}
+    rejected = 0
+    for scene_name, anchors in scene_anchors.items():
+        kept = []
+        for anchor in anchors:
+            paths = anchor.history_images + anchor.future_images
+            if all(is_decodable(path) for path in paths):
+                kept.append(anchor)
+            else:
+                rejected += 1
+        if kept:
+            filtered[scene_name] = kept
+    return filtered, rejected, bad_examples
 
 
 def load_scene_anchors(
@@ -271,7 +339,7 @@ def load_scene_anchors(
             for h in hist_rows
         ]
         if not all(
-            (image_root / h["filename_jpg"]).exists() for h in hist_rows
+            is_usable_image_file(image_root / h["filename_jpg"]) for h in hist_rows
         ):
             continue
 
@@ -285,7 +353,7 @@ def load_scene_anchors(
                 future_ok = False
                 break
             fi_row = image_rows[fi_idx]
-            if not (image_root / fi_row["filename_jpg"]).exists():
+            if not is_usable_image_file(image_root / fi_row["filename_jpg"]):
                 future_ok = False
                 break
             future_images.append(
@@ -464,6 +532,7 @@ def build_traj_swap_negatives(
         neg_src = anchors[neg_idx]
         row = {
             "sample_id": f"{anchor.sample_id}__traj_swap",
+            "group_id": anchor.sample_id,
             "scene_name": anchor.scene_name,
             "timestamp_us": anchor.timestamp_us,
             "history_images": anchor.history_images,
@@ -473,6 +542,8 @@ def build_traj_swap_negatives(
             "consistency_label": 0,
             "source_type": "traj_swap",
             "negative_family": "swap",
+            "negative_source_id": neg_src.sample_id,
+            "label_quality": "clean_negative",
         }
         negatives.append(with_validity(row, neg_src.candidate_traj, anchor.ego_state))
     return negatives
@@ -493,6 +564,7 @@ def build_image_swap_negatives(
         neg_src = anchors[neg_idx]
         row = {
             "sample_id": f"{anchor.sample_id}__image_swap",
+            "group_id": anchor.sample_id,
             "scene_name": anchor.scene_name,
             "timestamp_us": anchor.timestamp_us,
             "history_images": anchor.history_images,
@@ -502,6 +574,8 @@ def build_image_swap_negatives(
             "consistency_label": 0,
             "source_type": "image_swap",
             "negative_family": "swap",
+            "negative_source_id": neg_src.sample_id,
+            "label_quality": "clean_negative",
         }
         negatives.append(with_validity(row, anchor.candidate_traj, anchor.ego_state))
     return negatives
@@ -513,32 +587,45 @@ def build_time_shift_future_negatives(
 ) -> List[Dict]:
     """N3: 同一 scene 内错位 future images，是比跨 scene image_swap 更强的 hard negative。"""
     negatives: List[Dict] = []
-    n = len(anchors)
-    if n < 2:
-        return negatives
-    shift = max(1, min(abs(shift_steps), n - 1))
-    for idx, anchor in enumerate(anchors):
-        shift_idx = idx + shift
-        if shift_idx >= n:
-            shift_idx = idx - shift
-        if shift_idx < 0 or shift_idx == idx:
+    scene_anchors: Dict[str, List[ConsistencyAnchor]] = {}
+    for anchor in anchors:
+        scene_anchors.setdefault(anchor.scene_name, []).append(anchor)
+
+    for scene_items in scene_anchors.values():
+        scene_items.sort(key=lambda item: item.timestamp_us)
+        n = len(scene_items)
+        if n < 2:
             continue
-        shifted = anchors[shift_idx]
-        row = {
-            "sample_id": f"{anchor.sample_id}__time_shift_future_{shift}",
-            "scene_name": anchor.scene_name,
-            "timestamp_us": anchor.timestamp_us,
-            "history_images": anchor.history_images,
-            "future_images": shifted.future_images,
-            "ego_state": anchor.ego_state,
-            "candidate_traj": anchor.candidate_traj,
-            "consistency_label": 0,
-            "source_type": "time_shift_future",
-            "negative_family": "time_shift",
-            "time_shift_anchor_steps": shift,
-            "time_shift_timestamp_us": shifted.timestamp_us - anchor.timestamp_us,
-        }
-        negatives.append(with_validity(row, anchor.candidate_traj, anchor.ego_state))
+        requested_shift = max(1, min(abs(shift_steps), n - 1))
+        for idx, anchor in enumerate(scene_items):
+            candidates = [candidate for candidate in range(n) if candidate != idx]
+            shift_idx = min(
+                candidates,
+                key=lambda candidate: (
+                    abs(abs(candidate - idx) - requested_shift),
+                    0 if candidate > idx else 1,
+                ),
+            )
+            actual_shift = shift_idx - idx
+            shifted = scene_items[shift_idx]
+            row = {
+                "sample_id": f"{anchor.sample_id}__time_shift_future_{actual_shift}",
+                "group_id": anchor.sample_id,
+                "scene_name": anchor.scene_name,
+                "timestamp_us": anchor.timestamp_us,
+                "history_images": anchor.history_images,
+                "future_images": shifted.future_images,
+                "ego_state": anchor.ego_state,
+                "candidate_traj": anchor.candidate_traj,
+                "consistency_label": 0,
+                "source_type": "time_shift_future",
+                "negative_family": "time_shift",
+                "time_shift_anchor_steps": actual_shift,
+                "time_shift_timestamp_us": shifted.timestamp_us - anchor.timestamp_us,
+                "negative_source_id": shifted.sample_id,
+                "label_quality": "clean_negative",
+            }
+            negatives.append(with_validity(row, anchor.candidate_traj, anchor.ego_state))
     return negatives
 
 
@@ -579,8 +666,10 @@ def perturb_trajectory(
     elif perturb_type == "speed":
         # 速度缩放: 缩放纵向+横向位移
         scale = rng.uniform(*speed_range)
-        while 0.9 < scale < 1.1:
+        attempts = 0
+        while 0.85 < scale < 1.15 and attempts < 16:
             scale = rng.uniform(*speed_range)
+            attempts += 1
         magnitude = abs(scale - 1.0)
         for pt in perturbed:
             pt[0] *= scale
@@ -592,12 +681,33 @@ def perturb_trajectory(
     return perturbed, magnitude
 
 
+def perturb_level(perturb_type: str, magnitude: float) -> str:
+    if perturb_type == "heading":
+        if magnitude < 12.0:
+            return "weak"
+        if magnitude < 18.0:
+            return "medium"
+        return "strong"
+    if perturb_type == "speed":
+        if magnitude < 0.2:
+            return "weak"
+        if magnitude < 0.4:
+            return "medium"
+        return "strong"
+    if magnitude < 1.25:
+        return "weak"
+    if magnitude < 2.25:
+        return "medium"
+    return "strong"
+
+
 def build_perturb_negatives(
     anchors: List[ConsistencyAnchor],
     rng: random.Random,
     lateral_range: Tuple[float, float],
     heading_range: Tuple[float, float],
     speed_range: Tuple[float, float],
+    perturb_policy: str,
 ) -> List[Dict]:
     """N3: 对 GT 轨迹做语义扰动
 
@@ -606,35 +716,35 @@ def build_perturb_negatives(
     perturb_types = ["lateral", "heading", "speed"]
     negatives: List[Dict] = []
     for anchor in anchors:
-        ptype = rng.choice(perturb_types)
-        new_traj, magnitude = perturb_trajectory(
-            anchor.candidate_traj,
-            perturb_type=ptype,
-            rng=rng,
-            lateral_range=lateral_range,
-            heading_range=heading_range,
-            speed_range=speed_range,
-        )
-        row = {
-            "sample_id": f"{anchor.sample_id}__perturb_{ptype}",
-            "scene_name": anchor.scene_name,
-            "timestamp_us": anchor.timestamp_us,
-            "history_images": anchor.history_images,
-            "future_images": anchor.future_images,
-            "ego_state": anchor.ego_state,
-            "candidate_traj": new_traj,
-            "consistency_label": 0,
-            "source_type": f"perturb_{ptype}",
-            "negative_family": "perturb",
-            "perturb_type": ptype,
-            "perturb_magnitude": magnitude,
-            "perturb_level": (
-                "small" if magnitude < 0.5 else "medium" if magnitude < 1.0 else "large"
-            ) if ptype != "heading" else (
-                "small" if magnitude < 7.5 else "medium" if magnitude < 12.0 else "large"
-            ),
-        }
-        negatives.append(with_validity(row, new_traj, anchor.ego_state))
+        selected_types = perturb_types if perturb_policy == "all" else [rng.choice(perturb_types)]
+        for ptype in selected_types:
+            new_traj, magnitude = perturb_trajectory(
+                anchor.candidate_traj,
+                perturb_type=ptype,
+                rng=rng,
+                lateral_range=lateral_range,
+                heading_range=heading_range,
+                speed_range=speed_range,
+            )
+            level = perturb_level(ptype, magnitude)
+            row = {
+                "sample_id": f"{anchor.sample_id}__perturb_{ptype}",
+                "group_id": anchor.sample_id,
+                "scene_name": anchor.scene_name,
+                "timestamp_us": anchor.timestamp_us,
+                "history_images": anchor.history_images,
+                "future_images": anchor.future_images,
+                "ego_state": anchor.ego_state,
+                "candidate_traj": new_traj,
+                "consistency_label": 0,
+                "source_type": f"perturb_{ptype}",
+                "negative_family": "perturb",
+                "perturb_type": ptype,
+                "perturb_magnitude": magnitude,
+                "perturb_level": level,
+                "label_quality": "weak_negative" if level == "weak" else "clean_negative",
+            }
+            negatives.append(with_validity(row, new_traj, anchor.ego_state))
     return negatives
 
 
@@ -649,14 +759,19 @@ def serialize_split(
     heading_range: Tuple[float, float],
     speed_range: Tuple[float, float],
     time_shift_future_steps: int,
+    perturb_policy: str,
 ) -> List[Dict]:
-    """将 anchor 列表转为正样本 + 四类负样本 (正:负 ~= 1:4)"""
+    """将 anchor 列表转为正样本 + 多类负样本。
+
+    每个 anchor 的所有候选共享 group_id，便于后续按同一 anchor 做 ranking。
+    """
     rng = random.Random(seed)
 
     # 正样本: gt_pos
     positives = [
         {
             "sample_id": f"{a.sample_id}__gt_pos",
+            "group_id": a.sample_id,
             "scene_name": a.scene_name,
             "timestamp_us": a.timestamp_us,
             "history_images": a.history_images,
@@ -666,6 +781,7 @@ def serialize_split(
             "consistency_label": 1,
             "source_type": "gt_pos",
             "negative_family": "positive",
+            "label_quality": "positive",
         }
         for a in anchors
     ]
@@ -679,7 +795,7 @@ def serialize_split(
     neg_img = build_image_swap_negatives(anchors, min_gap, rng)
     neg_time = build_time_shift_future_negatives(anchors, time_shift_future_steps)
     neg_perturb = build_perturb_negatives(
-        anchors, rng, lateral_range, heading_range, speed_range,
+        anchors, rng, lateral_range, heading_range, speed_range, perturb_policy,
     )
 
     all_rows = positives + neg_traj + neg_img + neg_time + neg_perturb
@@ -775,6 +891,19 @@ def main() -> None:
         raise RuntimeError(
             "未找到可用场景，请检查 mini db 和 camera 目录"
         )
+    filtered_bad_image_anchors = 0
+    bad_image_examples: List[str] = []
+    if not args.skip_image_decode_verification:
+        all_scene_anchors, filtered_bad_image_anchors, bad_image_examples = (
+            filter_decodable_anchors(all_scene_anchors, image_roots)
+        )
+        print(
+            "图片解码校验完成: "
+            f"filtered_bad_image_anchors={filtered_bad_image_anchors}"
+        )
+        usable_scenes = sorted(all_scene_anchors.keys())
+        if not usable_scenes:
+            raise RuntimeError("图片解码校验后没有可用场景")
 
     train_scenes, val_scenes = split_scenes(
         usable_scenes, val_ratio=args.val_ratio, seed=args.seed,
@@ -802,6 +931,7 @@ def main() -> None:
         heading_range=hdg_range,
         speed_range=spd_range,
         time_shift_future_steps=args.time_shift_future_steps,
+        perturb_policy=args.perturb_policy,
     )
     val_rows = serialize_split(
         val_anchors,
@@ -811,6 +941,7 @@ def main() -> None:
         heading_range=hdg_range,
         speed_range=spd_range,
         time_shift_future_steps=args.time_shift_future_steps,
+        perturb_policy=args.perturb_policy,
     )
 
     train_path = output_dir / "consistency_train.jsonl"
@@ -830,6 +961,7 @@ def main() -> None:
         "perturb_lateral_range": list(args.perturb_lateral_range),
         "perturb_heading_range": list(args.perturb_heading_range),
         "perturb_speed_range": list(args.perturb_speed_range),
+        "perturb_policy": args.perturb_policy,
         "time_shift_future_steps": args.time_shift_future_steps,
         "traj_scale_factors": traj_scale,
         "train_scenes": train_scenes,
@@ -841,6 +973,8 @@ def main() -> None:
         "train_source_types": count_source_types(train_rows),
         "val_source_types": count_source_types(val_rows),
         "skipped_scenes": skipped_scenes,
+        "filtered_bad_image_anchors": filtered_bad_image_anchors,
+        "bad_image_examples": bad_image_examples,
     }
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)

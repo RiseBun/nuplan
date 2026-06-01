@@ -78,6 +78,9 @@ def summarize_delta(base_scores: torch.Tensor, stress_scores: torch.Tensor) -> D
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    if args.checkpoint is not None:
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        cfg = checkpoint.get("config", cfg)
     if args.baseline_mode is not None:
         cfg["baseline_mode"] = args.baseline_mode
 

@@ -49,6 +49,12 @@ def parse_args() -> argparse.Namespace:
         help="评估 batch size (默认: 32)",
     )
     parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="评估 DataLoader worker 数。默认 0，更稳但可能更慢。",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=0,
@@ -64,6 +70,11 @@ def parse_args() -> argparse.Namespace:
         choices=["full", "no_image", "ego_only", "no_traj", "traj_only"],
         default=None,
         help="覆盖 checkpoint/config 中的 P0 baseline mode",
+    )
+    parser.add_argument(
+        "--output-prefix",
+        default=None,
+        help="输出文件前缀，默认 eval_<split>。可用于 quick eval 避免覆盖正式结果。",
     )
     return parser.parse_args()
 
@@ -111,31 +122,85 @@ def _compute_head_metrics(
 ) -> Dict[str, Any]:
     """计算单个 head 的详细指标"""
     probs = torch.sigmoid(logits)
-    preds = (probs >= 0.5).float()
-
     pos_mask = labels == 1.0
     neg_mask = labels == 0.0
     num_pos = pos_mask.sum().item()
     num_neg = neg_mask.sum().item()
 
-    tp = ((preds == 1) & (labels == 1)).sum().item()
-    fp = ((preds == 1) & (labels == 0)).sum().item()
-    fn = ((preds == 0) & (labels == 1)).sum().item()
-    tn = ((preds == 0) & (labels == 0)).sum().item()
+    def metrics_at_threshold(threshold: float) -> Dict[str, Any]:
+        preds = (probs >= threshold).float()
+        tp = ((preds == 1) & (labels == 1)).sum().item()
+        fp = ((preds == 1) & (labels == 0)).sum().item()
+        fn = ((preds == 0) & (labels == 1)).sum().item()
+        tn = ((preds == 0) & (labels == 0)).sum().item()
+        precision = tp / (tp + fp) if (tp + fp) > 0 else None
+        recall = tp / (tp + fn) if (tp + fn) > 0 else None
+        f1 = (
+            2 * precision * recall / (precision + recall)
+            if precision is not None and recall is not None
+            and (precision + recall) > 0
+            else None
+        )
+        accuracy = (preds == labels).float().mean().item()
+        tnr = tn / (tn + fp) if (tn + fp) > 0 else None
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else None
+        balanced_accuracy = (
+            (recall + tnr) / 2
+            if recall is not None and tnr is not None
+            else None
+        )
+        return {
+            "threshold": float(threshold),
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1,
+            "tnr": tnr,
+            "fpr": fpr,
+            "balanced_accuracy": balanced_accuracy,
+            "tp": int(tp),
+            "fp": int(fp),
+            "fn": int(fn),
+            "tn": int(tn),
+        }
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else None
-    recall = tp / (tp + fn) if (tp + fn) > 0 else None
-    f1 = (
-        2 * precision * recall / (precision + recall)
-        if precision is not None and recall is not None
-        and (precision + recall) > 0
-        else None
-    )
-    accuracy = (preds == labels).float().mean().item()
+    fixed = metrics_at_threshold(0.5)
 
-    # TNR / FPR
-    tnr = tn / (tn + fp) if (tn + fp) > 0 else None
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else None
+    best_f1 = None
+    best_balanced = None
+    recall_thresholds: Dict[str, Any] = {}
+    if num_pos > 0 and num_neg > 0:
+        # 用固定网格估计 operating point，避免全量验证集上逐唯一概率扫描过慢。
+        candidate_thresholds = torch.linspace(0.0, 1.0, steps=201).tolist()
+        candidate_thresholds.append(0.5)
+        for threshold in sorted(set(float(t) for t in candidate_thresholds)):
+            current = metrics_at_threshold(threshold)
+            f1 = current["f1_score"]
+            if f1 is not None and (
+                best_f1 is None or f1 > best_f1["f1_score"]
+            ):
+                best_f1 = current
+            bal = current["balanced_accuracy"]
+            if bal is not None and (
+                best_balanced is None or bal > best_balanced["balanced_accuracy"]
+            ):
+                best_balanced = current
+        for target_recall in (0.80, 0.90, 0.95):
+            valid = []
+            for threshold in sorted(set(float(t) for t in candidate_thresholds)):
+                current = metrics_at_threshold(threshold)
+                recall = current["recall"]
+                if recall is not None and recall >= target_recall:
+                    valid.append(current)
+            if valid:
+                selected = max(
+                    valid,
+                    key=lambda item: (
+                        item["tnr"] if item["tnr"] is not None else -1.0,
+                        item["precision"] if item["precision"] is not None else -1.0,
+                    ),
+                )
+                recall_thresholds[f"recall>={target_recall:.2f}"] = selected
 
     # AUC 计算
     auc: float | None = None
@@ -162,21 +227,26 @@ def _compute_head_metrics(
     return {
         "num_positive": int(num_pos),
         "num_negative": int(num_neg),
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1,
-        "tnr": tnr,
-        "fpr": fpr,
+        "accuracy": fixed["accuracy"],
+        "precision": fixed["precision"],
+        "recall": fixed["recall"],
+        "f1_score": fixed["f1_score"],
+        "tnr": fixed["tnr"],
+        "fpr": fixed["fpr"],
+        "balanced_accuracy": fixed["balanced_accuracy"],
         "auc": auc,
         "pr_auc": pr_auc,
         "ece": _compute_ece(probs, labels),
-        "tp": int(tp),
-        "fp": int(fp),
-        "fn": int(fn),
-        "tn": int(tn),
+        "tp": fixed["tp"],
+        "fp": fixed["fp"],
+        "fn": fixed["fn"],
+        "tn": fixed["tn"],
         "pos_prob_mean": float(pos_probs.mean()) if len(pos_probs) > 0 else 0.0,
         "neg_prob_mean": float(neg_probs.mean()) if len(neg_probs) > 0 else 0.0,
+        "fixed_threshold": fixed,
+        "best_f1_threshold": best_f1,
+        "best_balanced_accuracy_threshold": best_balanced,
+        "recall_operating_points": recall_thresholds,
     }
 
 
@@ -186,6 +256,7 @@ def evaluate_consistency(
     device: torch.device,
     batch_size: int,
     max_samples: int,
+    num_workers: int = 0,
 ) -> Dict[str, Any]:
     """评估 Consistency Critic 模型，返回双头指标和 per-source-type 分组统计"""
     from torch.utils.data import DataLoader
@@ -193,7 +264,7 @@ def evaluate_consistency(
 
     loader = DataLoader(
         dataset, batch_size=batch_size, shuffle=False,
-        num_workers=2, pin_memory=True,
+        num_workers=num_workers, pin_memory=True,
     )
     model.eval()
 
@@ -207,28 +278,34 @@ def evaluate_consistency(
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
+            remaining = max_samples - total_samples if max_samples else len(
+                batch["consistency_label"]
+            )
+            if remaining <= 0:
+                break
+            batch_limit = min(len(batch["consistency_label"]), remaining)
             h_imgs = batch["history_images"].to(device, non_blocking=True)
             f_imgs = batch["future_images"].to(device, non_blocking=True)
             ego = batch["ego_state"].to(device, non_blocking=True)
             traj = batch["candidate_traj"].to(device, non_blocking=True)
-            c_labels = batch["consistency_label"]
-            v_labels = batch["validity_label"]
+            c_labels = batch["consistency_label"][:batch_limit]
+            v_labels = batch["validity_label"][:batch_limit]
 
             out = model(h_imgs, f_imgs, ego, traj)
-            all_c_logits.append(out["consistency_logit"].cpu())
-            all_v_logits.append(out["validity_logit"].cpu())
+            all_c_logits.append(out["consistency_logit"][:batch_limit].cpu())
+            all_v_logits.append(out["validity_logit"][:batch_limit].cpu())
             all_c_labels.append(c_labels)
             all_v_labels.append(v_labels)
 
             # 收集 source_type
             start = batch_idx * batch_size
-            end = min(start + len(c_labels), len(dataset))
+            end = min(start + batch_limit, len(dataset))
             for i in range(start, end):
                 st = dataset.samples[i].get("source_type", "unknown")
                 all_source_types.append(st)
                 sample_meta.append(dataset.samples[i])
 
-            total_samples += len(c_labels)
+            total_samples += batch_limit
             if (batch_idx + 1) % 20 == 0:
                 print(
                     f"[Eval] step={batch_idx + 1}/{len(loader)} "
@@ -313,6 +390,7 @@ def _print_head_metrics(name: str, m: Dict[str, Any], indent: str = "  ") -> Non
     """打印单个 head 的评估指标"""
     print(f"{indent}[{name}]")
     print(f"{indent}  正/负样本数: {m['num_positive']} / {m['num_negative']}")
+    print(f"{indent}  固定阈值: 0.5000")
     print(f"{indent}  Accuracy:  {m['accuracy']:.4f}")
     if m['num_positive'] > 0:
         p = m['precision']
@@ -342,6 +420,32 @@ def _print_head_metrics(name: str, m: Dict[str, Any], indent: str = "  ") -> Non
     print(f"{indent}  TP={m['tp']}, FP={m['fp']}, FN={m['fn']}, TN={m['tn']}")
     print(f"{indent}  正样本概率均值: {m['pos_prob_mean']:.4f}")
     print(f"{indent}  负样本概率均值: {m['neg_prob_mean']:.4f}")
+    if m.get("best_f1_threshold"):
+        best = m["best_f1_threshold"]
+        print(
+            f"{indent}  Best-F1阈值: {best['threshold']:.4f} "
+            f"F1={best['f1_score']:.4f} "
+            f"Recall={best['recall']:.4f} "
+            f"TNR={best['tnr']:.4f}"
+        )
+    if m.get("best_balanced_accuracy_threshold"):
+        best = m["best_balanced_accuracy_threshold"]
+        print(
+            f"{indent}  Best-BalAcc阈值: {best['threshold']:.4f} "
+            f"BalAcc={best['balanced_accuracy']:.4f} "
+            f"Recall={best['recall']:.4f} "
+            f"TNR={best['tnr']:.4f}"
+        )
+    if m.get("recall_operating_points"):
+        print(f"{indent}  Recall operating points:")
+        for key, point in m["recall_operating_points"].items():
+            precision = point["precision"]
+            precision_text = f"{precision:.4f}" if precision is not None else "N/A"
+            print(
+                f"{indent}    {key}: threshold={point['threshold']:.4f} "
+                f"precision={precision_text} "
+                f"tnr={point['tnr']:.4f}"
+            )
 
 
 def _format_source_line(m: Dict[str, Any]) -> str:
@@ -361,128 +465,151 @@ def compute_ranking_metrics(
     dataset: "ConsistencyDataset",
     device: torch.device,
     batch_size: int = 32,
+    max_samples: int = 0,
+    num_workers: int = 0,
 ) -> Dict[str, Any]:
     """评估 Consistency Critic 的 Ranking 能力
     
     对于同一 history 的多个候选轨迹，评估模型是否能正确排序
     Metrics: NDCG@k, MRR, Top-1 Hit Rate
     """
-    from torch.utils.data import DataLoader
+    from torch.utils.data import DataLoader, Subset
     
-    # 按 scene 分组
+    # 按同一个 anchor/group 分组，而不是把整段 scene 混在一起。
+    # build_consistency_index.py 会写入 group_id；旧索引用 scene+timestamp 兜底。
     scene_groups = defaultdict(list)
     for idx, sample in enumerate(dataset.samples):
         scene_name = sample.get("scene_name", "unknown")
         timestamp = sample.get("timestamp_us", idx)
-        scene_groups[scene_name].append({
+        group_id = sample.get("group_id") or f"{scene_name}__{timestamp}"
+        scene_groups[str(group_id)].append({
             "index": idx,
             "timestamp": timestamp,
             "consistency_label": sample.get("consistency_label", 0),
             "validity_label": sample.get("validity_label", 0),
         })
     
-    # 过滤出有多个候选的 scenes
-    multi_candidate_scenes = {
-        scene: samples for scene, samples in scene_groups.items()
+    # 过滤出有多个候选且至少包含一个正样本的 group。
+    candidate_groups = [
+        (scene, samples)
+        for scene, samples in scene_groups.items()
         if len(samples) >= 2
-    }
+        and any(float(sample.get("consistency_label", 0)) > 0 for sample in samples)
+    ]
+    candidate_groups.sort(
+        key=lambda item: min(sample["index"] for sample in item[1]),
+    )
+
+    selected_groups = []
+    selected_indices = []
+    selected_count = 0
+    for scene, samples in candidate_groups:
+        group_indices = [sample["index"] for sample in samples]
+        if max_samples > 0 and selected_count + len(group_indices) > max_samples:
+            if not selected_groups:
+                selected_groups.append((scene, samples))
+                selected_indices.extend(group_indices)
+            break
+        selected_groups.append((scene, samples))
+        selected_indices.extend(group_indices)
+        selected_count += len(group_indices)
     
-    if not multi_candidate_scenes:
+    if not selected_groups:
         print("[WARNING] 没有找到多候选场景，跳过 ranking 评估")
         return {}
     
-    print(f"\n[Ranking Evaluation] 找到 {len(multi_candidate_scenes)} 个多候选场景")
+    print(
+        f"\n[Ranking Evaluation] groups={len(selected_groups)}/"
+        f"{len(candidate_groups)} samples={len(selected_indices)}"
+    )
     
     model.eval()
+    subset = Subset(dataset, selected_indices)
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    score_by_index: Dict[int, float] = {}
+    offset = 0
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(loader, start=1):
+            out = model(
+                batch["history_images"].to(device, non_blocking=True),
+                batch["future_images"].to(device, non_blocking=True),
+                batch["ego_state"].to(device, non_blocking=True),
+                batch["candidate_traj"].to(device, non_blocking=True),
+            )
+            scores = torch.sigmoid(out["consistency_logit"]).detach().cpu().tolist()
+            for i, score in enumerate(scores):
+                score_by_index[selected_indices[offset + i]] = float(score)
+            offset += len(scores)
+            if batch_idx % 20 == 0 or batch_idx == len(loader):
+                print(
+                    f"[Ranking] scored_batches={batch_idx}/{len(loader)} "
+                    f"samples={offset}",
+                    flush=True,
+                )
+
     all_ndcg_3 = []
     all_ndcg_5 = []
     all_mrr = []
     all_top1_hit = []
     
-    with torch.no_grad():
-        for scene_idx, (scene_name, candidates) in enumerate(multi_candidate_scenes.items(), start=1):
-            # 收集该 scene 的所有样本
-            scores = []
-            relevances = []  # GT relevance (consistency_label)
-            
-            for cand in candidates:
-                idx = cand["index"]
-                sample = dataset[idx]
-                
-                h_imgs = sample["history_images"].unsqueeze(0).to(device)
-                f_imgs = sample["future_images"].unsqueeze(0).to(device)
-                ego = sample["ego_state"].unsqueeze(0).to(device)
-                traj = sample["candidate_traj"].unsqueeze(0).to(device)
-                
-                out = model(h_imgs, f_imgs, ego, traj)
-                score = torch.sigmoid(out["consistency_logit"]).item()
-                
-                scores.append(score)
-                relevances.append(cand["consistency_label"])
-            
-            # 计算 NDCG@k
-            def compute_ndcg(scores_list, relevance_list, k):
-                if len(scores_list) < 2:
-                    return 0.0
-                
-                # 按分数排序
-                sorted_pairs = sorted(zip(scores_list, relevance_list), reverse=True)
-                sorted_relevances = [rel for _, rel in sorted_pairs[:k]]
-                
-                # DCG
-                dcg = sum(
-                    rel / np.log2(i + 2) for i, rel in enumerate(sorted_relevances)
-                )
-                
-                # Ideal DCG
-                ideal_relevances = sorted(relevance_list, reverse=True)[:k]
-                idcg = sum(
-                    rel / np.log2(i + 2) for i, rel in enumerate(ideal_relevances)
-                )
-                
-                return dcg / idcg if idcg > 0 else 0.0
-            
-            # 计算 MRR
-            def compute_mrr(scores_list, relevance_list):
-                if len(scores_list) < 2:
-                    return 0.0
-                
-                # 按分数排序
-                sorted_pairs = sorted(zip(scores_list, relevance_list), reverse=True)
-                
-                # 找到第一个正样本的位置
-                for i, (_, rel) in enumerate(sorted_pairs):
-                    if rel == 1:
-                        return 1.0 / (i + 1)
-                return 0.0
-            
-            # 计算 Top-1 Hit Rate
-            def compute_top1_hit(scores_list, relevance_list):
-                if len(scores_list) < 2:
-                    return 0.0
-                
-                # 找到分数最高的样本
-                best_idx = np.argmax(scores_list)
-                return 1.0 if relevance_list[best_idx] == 1 else 0.0
-            
-            # 累积指标
-            all_ndcg_3.append(compute_ndcg(scores, relevances, k=3))
-            all_ndcg_5.append(compute_ndcg(scores, relevances, k=5))
-            all_mrr.append(compute_mrr(scores, relevances))
-            all_top1_hit.append(compute_top1_hit(scores, relevances))
-            if scene_idx % 10 == 0 or scene_idx == len(multi_candidate_scenes):
-                print(
-                    f"[Ranking] scene={scene_idx}/{len(multi_candidate_scenes)} "
-                    f"candidates={len(candidates)}",
-                    flush=True,
-                )
+    def compute_ndcg(scores_list, relevance_list, k):
+        if len(scores_list) < 2:
+            return 0.0
+        sorted_pairs = sorted(zip(scores_list, relevance_list), reverse=True)
+        sorted_relevances = [rel for _, rel in sorted_pairs[:k]]
+        dcg = sum(
+            rel / np.log2(i + 2) for i, rel in enumerate(sorted_relevances)
+        )
+        ideal_relevances = sorted(relevance_list, reverse=True)[:k]
+        idcg = sum(
+            rel / np.log2(i + 2) for i, rel in enumerate(ideal_relevances)
+        )
+        return dcg / idcg if idcg > 0 else 0.0
+
+    def compute_mrr(scores_list, relevance_list):
+        if len(scores_list) < 2:
+            return 0.0
+        sorted_pairs = sorted(zip(scores_list, relevance_list), reverse=True)
+        for i, (_, rel) in enumerate(sorted_pairs):
+            if rel == 1:
+                return 1.0 / (i + 1)
+        return 0.0
+
+    def compute_top1_hit(scores_list, relevance_list):
+        if len(scores_list) < 2:
+            return 0.0
+        best_idx = np.argmax(scores_list)
+        return 1.0 if relevance_list[best_idx] == 1 else 0.0
+
+    for scene_idx, (scene_name, candidates) in enumerate(selected_groups, start=1):
+        scores = [score_by_index[cand["index"]] for cand in candidates]
+        relevances = [float(cand["consistency_label"]) for cand in candidates]
+        all_ndcg_3.append(compute_ndcg(scores, relevances, k=3))
+        all_ndcg_5.append(compute_ndcg(scores, relevances, k=5))
+        all_mrr.append(compute_mrr(scores, relevances))
+        all_top1_hit.append(compute_top1_hit(scores, relevances))
+        if scene_idx % 200 == 0 or scene_idx == len(selected_groups):
+            print(
+                f"[Ranking] evaluated_groups={scene_idx}/{len(selected_groups)}",
+                flush=True,
+            )
     
     return {
         "ndcg@3": float(np.mean(all_ndcg_3)) if all_ndcg_3 else 0.0,
         "ndcg@5": float(np.mean(all_ndcg_5)) if all_ndcg_5 else 0.0,
         "mrr": float(np.mean(all_mrr)) if all_mrr else 0.0,
         "top1_hit_rate": float(np.mean(all_top1_hit)) if all_top1_hit else 0.0,
-        "num_scenes": len(multi_candidate_scenes),
+        "num_scenes": len(selected_groups),
+        "num_ranked_groups": len(all_top1_hit),
+        "num_scored_samples": len(selected_indices),
+        "total_candidate_groups": len(candidate_groups),
+        "max_samples": int(max_samples),
     }
 
 
@@ -548,6 +675,7 @@ def main() -> None:
         device=device,
         batch_size=args.batch_size,
         max_samples=args.max_samples,
+        num_workers=args.num_workers,
     )
     print("\n" + "=" * 60)
     print("IAC Consistency Critic 评估结果")
@@ -579,7 +707,8 @@ def main() -> None:
     print("=" * 60)
 
     # 保存结果到 JSON
-    result_path = ckpt_path.parent.parent / f"eval_{args.split}_results.json"
+    output_prefix = args.output_prefix or f"eval_{args.split}"
+    result_path = ckpt_path.parent.parent / f"{output_prefix}_results.json"
     
     # 如果启用 ranking 评估
     if args.eval_ranking:
@@ -591,6 +720,8 @@ def main() -> None:
             dataset=dataset,
             device=device,
             batch_size=args.batch_size,
+            max_samples=args.max_samples,
+            num_workers=args.num_workers,
         )
         
         if ranking_metrics:
@@ -609,17 +740,25 @@ def main() -> None:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
     print(f"\n结果已保存: {result_path}")
 
-    summary_path = ckpt_path.parent.parent / f"eval_{args.split}_summary.json"
+    summary_path = ckpt_path.parent.parent / f"{output_prefix}_summary.json"
     summary = {
         "total_samples": metrics["total_samples"],
         "baseline_mode": cfg.get("baseline_mode", "full"),
         "consistency": {
             k: metrics["consistency"].get(k)
-            for k in ("accuracy", "auc", "pr_auc", "ece", "f1_score", "tnr", "fpr")
+            for k in (
+                "accuracy", "auc", "pr_auc", "ece", "f1_score", "tnr", "fpr",
+                "balanced_accuracy", "best_f1_threshold",
+                "best_balanced_accuracy_threshold", "recall_operating_points",
+            )
         },
         "validity": {
             k: metrics["validity"].get(k)
-            for k in ("accuracy", "auc", "pr_auc", "ece", "f1_score", "tnr", "fpr")
+            for k in (
+                "accuracy", "auc", "pr_auc", "ece", "f1_score", "tnr", "fpr",
+                "balanced_accuracy", "best_f1_threshold",
+                "best_balanced_accuracy_threshold", "recall_operating_points",
+            )
         },
         "negative_recall_by_type": metrics.get("negative_recall_by_type", {}),
         "graded_perturbation_curve": metrics.get("graded_perturbation_curve", {}),

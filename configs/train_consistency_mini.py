@@ -44,14 +44,36 @@ cfg = dict(
     lambda_consistency=1.0,
     lambda_validity=0.5,
     positive_weight=1.0,
-    consistency_positive_weight=4.0,  # Consistency Head 正负样本比约 1:4
-    validity_positive_weight=1.0,     # Validity Head 正负样本比 1:1
+    # 折中版本：pos_weight=4.0 过宽松，2.0 又过保守；3.0 配合温和 hard-negative
+    # 权重，目标是在保留 TNR 提升的同时恢复正样本 recall。
+    consistency_positive_weight=3.0,
+    validity_positive_weight=1.0,
+    validity_negative_weight=8.0,
+    default_consistency_weight=1.0,
+    consistency_source_weights=dict(
+        gt_pos=1.0,
+        image_swap=1.0,
+        traj_swap=2.0,
+        time_shift_future=2.0,
+        perturb_lateral=2.5,
+        perturb_heading=2.5,
+        perturb_speed=2.5,
+    ),
+    label_quality_weights=dict(
+        positive=1.0,
+        clean_negative=1.0,
+        weak_negative=0.35,
+    ),
     
     # 细粒度 heads 暂无独立标签，本轮 P0 改造不把它们作为真实监督。
     lambda_speed_consistency=0.0,
     lambda_steering_consistency=0.0,
     lambda_progress_consistency=0.0,
     lambda_temporal_coherence=0.0,
+    # 同一 group_id 内直接优化“正样本分数高于负样本”。
+    # 这个目标和 WAM benchmark 的候选排序更一致，权重先保持温和，避免压坏校准。
+    lambda_group_ranking=0.2,
+    group_ranking_margin=0.2,
     baseline_mode="full",  # full | no_image | ego_only | no_traj | traj_only
     # 优化器
     optimizer=dict(
@@ -66,6 +88,8 @@ cfg = dict(
         hidden_dim=256,
         fusion_dim=256,
         dropout=0.1,
+        use_action_visual_interaction=True,
+        temporal_encoder="gru",  # "mean" keeps legacy checkpoint compatibility.
     ),
     # 数据集预处理
     dataset=dict(
@@ -80,6 +104,9 @@ cfg = dict(
     # Ranking 评估配置（用于候选排序能力测试）
     ranking=dict(
         enabled=True,
+        group_batches=True,
+        loss_weight=0.2,
+        margin=0.2,
         num_candidates_per_scene=5,       # 每个scene的候选数
         ranking_metrics=["ndcg@3", "ndcg@5", "mrr", "top1_hit_rate"],
     ),

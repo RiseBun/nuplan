@@ -11,7 +11,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, Iterator, List, Sequence
 
 import numpy as np
 import torch
@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
         "--preflight-samples",
         type=int,
         default=128,
-        help="Validate image paths from each index before training; 0 disables.",
+        help="Validate image paths from each index before training; 0 disables, -1 checks all rows.",
     )
     return parser.parse_args()
 
@@ -192,6 +192,20 @@ class ConsistencyDataset(Dataset):
             ds_cfg.get("image_std", [0.229, 0.224, 0.225]),
             dtype=torch.float32,
         )
+        self.consistency_source_weights = {
+            str(key): float(value)
+            for key, value in cfg.get("consistency_source_weights", {}).items()
+        }
+        self.label_quality_weights = {
+            str(key): float(value)
+            for key, value in cfg.get("label_quality_weights", {}).items()
+        }
+        self.default_consistency_weight = float(
+            cfg.get("default_consistency_weight", 1.0),
+        )
+        self.validity_negative_weight = float(
+            cfg.get("validity_negative_weight", 1.0),
+        )
         self.samples = self._load_jsonl()
 
     def _load_jsonl(self) -> List[Dict[str, Any]]:
@@ -312,6 +326,19 @@ class ConsistencyDataset(Dataset):
         v_label = torch.tensor(
             float(sample["validity_label"]), dtype=torch.float32,
         )
+        source_type = str(sample.get("source_type", sample.get("sample_type", "unknown")))
+        label_quality = str(sample.get("label_quality", "clean_negative" if c_label.item() == 0.0 else "positive"))
+        quality_weight = self.label_quality_weights.get(label_quality, 1.0)
+        c_weight = torch.tensor(
+            self.consistency_source_weights.get(
+                source_type, self.default_consistency_weight,
+            ) * quality_weight,
+            dtype=torch.float32,
+        )
+        v_weight = torch.tensor(
+            self.validity_negative_weight if float(v_label.item()) == 0.0 else 1.0,
+            dtype=torch.float32,
+        )
         return {
             "history_images": hist_imgs,
             "future_images": fut_imgs,
@@ -319,6 +346,9 @@ class ConsistencyDataset(Dataset):
             "candidate_traj": traj,
             "consistency_label": c_label,
             "validity_label": v_label,
+            "consistency_weight": c_weight,
+            "validity_weight": v_weight,
+            "sample_index": torch.tensor(index, dtype=torch.long),
         }
 
 
@@ -353,6 +383,14 @@ class ConsistencyCriticModel(nn.Module):
         traj_d = int(cfg["traj_dim"])
         self.baseline_mode = str(cfg.get("baseline_mode", "full"))
         self.consistency_traj_steps = consistency_traj_steps
+        self.use_action_visual_interaction = bool(
+            mcfg.get("use_action_visual_interaction", False),
+        )
+        self.temporal_encoder_type = str(mcfg.get("temporal_encoder", "mean"))
+        if self.temporal_encoder_type not in {"mean", "gru"}:
+            raise ValueError(
+                "model.temporal_encoder must be one of: mean, gru",
+            )
 
         # 共享 CNN backbone
         self.shared_backbone = nn.Sequential(
@@ -372,6 +410,20 @@ class ConsistencyCriticModel(nn.Module):
         )
         self.history_proj = nn.Linear(256, img_dim)
         self.future_proj = nn.Linear(256, img_dim)
+        if self.temporal_encoder_type == "gru":
+            self.history_temporal_encoder = nn.GRU(
+                input_size=img_dim,
+                hidden_size=img_dim,
+                batch_first=True,
+            )
+            self.future_temporal_encoder = nn.GRU(
+                input_size=img_dim,
+                hidden_size=img_dim,
+                batch_first=True,
+            )
+        else:
+            self.history_temporal_encoder = None
+            self.future_temporal_encoder = None
 
         self.consistency_traj_encoder = TrajectoryEncoder(
             consistency_traj_steps * traj_d, hidden, act_dim,
@@ -386,7 +438,17 @@ class ConsistencyCriticModel(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        consistency_dim = img_dim * 2 + act_dim * 2
+        if self.use_action_visual_interaction:
+            self.action_to_visual_delta = nn.Sequential(
+                nn.Linear(act_dim * 2, hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(hidden, img_dim),
+                nn.ReLU(inplace=True),
+            )
+            consistency_dim = img_dim * 7 + act_dim * 2
+        else:
+            self.action_to_visual_delta = None
+            consistency_dim = img_dim * 2 + act_dim * 2
         self.shared_fusion = nn.Sequential(
             nn.Linear(consistency_dim, fusion_dim),
             nn.ReLU(inplace=True),
@@ -415,15 +477,21 @@ class ConsistencyCriticModel(nn.Module):
         self.validity_head = nn.Linear(fusion_dim, 1)  # driving validity
 
     def _encode_images(
-        self, images: torch.Tensor, proj: nn.Linear,
+        self,
+        images: torch.Tensor,
+        proj: nn.Linear,
+        temporal_encoder: nn.GRU | None,
     ) -> torch.Tensor:
         """编码 (B, T, C, H, W) 图像序列为 (B, dim)"""
         b, t, c, h, w = images.shape
         x = images.reshape(b * t, c, h, w)
         x = self.shared_backbone(x).flatten(1)
         x = proj(x)
-        x = x.reshape(b, t, -1).mean(dim=1)
-        return x
+        x = x.reshape(b, t, -1)
+        if temporal_encoder is None:
+            return x.mean(dim=1)
+        _, hidden = temporal_encoder(x)
+        return hidden[-1]
 
     def forward(
         self,
@@ -432,8 +500,12 @@ class ConsistencyCriticModel(nn.Module):
         ego_state: torch.Tensor,
         candidate_traj: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
-        z_hist = self._encode_images(history_images, self.history_proj)
-        z_fut = self._encode_images(future_images, self.future_proj)
+        z_hist = self._encode_images(
+            history_images, self.history_proj, self.history_temporal_encoder,
+        )
+        z_fut = self._encode_images(
+            future_images, self.future_proj, self.future_temporal_encoder,
+        )
         consistency_traj = candidate_traj[:, : self.consistency_traj_steps, :]
         z_traj_consistency = self.consistency_traj_encoder(consistency_traj)
         z_traj_validity = self.validity_traj_encoder(candidate_traj)
@@ -449,7 +521,31 @@ class ConsistencyCriticModel(nn.Module):
         if mode == "traj_only":
             z_ego = torch.zeros_like(z_ego)
 
-        z_all = torch.cat([z_hist, z_fut, z_traj_consistency, z_ego], dim=-1)
+        if self.use_action_visual_interaction:
+            visual_delta = z_fut - z_hist
+            visual_abs_delta = visual_delta.abs()
+            assert self.action_to_visual_delta is not None
+            action_delta = self.action_to_visual_delta(
+                torch.cat([z_traj_consistency, z_ego], dim=-1),
+            )
+            action_visual_product = action_delta * visual_delta
+            action_visual_gap = (action_delta - visual_delta).abs()
+            z_all = torch.cat(
+                [
+                    z_hist,
+                    z_fut,
+                    visual_delta,
+                    visual_abs_delta,
+                    action_delta,
+                    action_visual_product,
+                    action_visual_gap,
+                    z_traj_consistency,
+                    z_ego,
+                ],
+                dim=-1,
+            )
+        else:
+            z_all = torch.cat([z_hist, z_fut, z_traj_consistency, z_ego], dim=-1)
         z_shared = self.shared_fusion(z_all)
         z_validity = self.validity_fusion(torch.cat([z_traj_validity, z_ego], dim=-1))
 
@@ -463,6 +559,136 @@ class ConsistencyCriticModel(nn.Module):
             # Layer 3: 驾驶合理性评估
             "validity_logit": self.validity_head(z_validity).squeeze(-1),
         }
+
+
+class GroupBatchSampler(Sampler[List[int]]):
+    """Yield complete group_id batches so ranking loss sees in-group candidates."""
+
+    def __init__(
+        self,
+        dataset: ConsistencyDataset,
+        batch_size: int,
+        shuffle: bool,
+        drop_last: bool,
+        seed: int,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        self.dataset = dataset
+        self.batch_size = max(1, int(batch_size))
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.seed = int(seed)
+        self.rank = int(rank)
+        self.world_size = max(1, int(world_size))
+        self.epoch = 0
+
+        groups: Dict[str, List[int]] = {}
+        for idx, sample in enumerate(dataset.samples):
+            fallback = f"{sample.get('scene_name', 'unknown')}__{sample.get('timestamp_us', idx)}"
+            group_id = str(sample.get("group_id") or fallback)
+            groups.setdefault(group_id, []).append(idx)
+        self.groups = list(groups.values())
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        groups = [list(group) for group in self.groups]
+        if self.shuffle:
+            rng.shuffle(groups)
+            for group in groups:
+                rng.shuffle(group)
+
+        batches: List[List[int]] = []
+        current: List[int] = []
+        for group in groups:
+            if current and len(current) + len(group) > self.batch_size:
+                batches.append(current)
+                current = []
+            if len(group) > self.batch_size:
+                for start in range(0, len(group), self.batch_size):
+                    chunk = group[start: start + self.batch_size]
+                    if len(chunk) == self.batch_size or not self.drop_last:
+                        batches.append(chunk)
+                continue
+            current.extend(group)
+        if current and (len(current) == self.batch_size or not self.drop_last):
+            batches.append(current)
+        if self.world_size > 1:
+            usable = len(batches) - (len(batches) % self.world_size)
+            batches = batches[:usable]
+
+        for batch_idx, batch in enumerate(batches):
+            if batch_idx % self.world_size == self.rank:
+                yield batch
+
+    def __len__(self) -> int:
+        total = 0
+        current = 0
+        for group in self.groups:
+            group_len = len(group)
+            if current and current + group_len > self.batch_size:
+                total += 1
+                current = 0
+            if group_len > self.batch_size:
+                full, rest = divmod(group_len, self.batch_size)
+                total += full
+                if rest and not self.drop_last:
+                    total += 1
+                continue
+            current += group_len
+        if current and (current == self.batch_size or not self.drop_last):
+            total += 1
+        if self.world_size > 1:
+            total -= total % self.world_size
+        return total // self.world_size
+
+
+def compute_group_ranking_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    sample_indices: torch.Tensor,
+    dataset: ConsistencyDataset | None,
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if dataset is None or sample_indices.numel() == 0:
+        zero = logits.sum() * 0.0
+        return zero, zero.detach(), zero.detach()
+
+    groups: Dict[str, Dict[str, List[torch.Tensor]]] = {}
+    for row, sample_index in enumerate(sample_indices.detach().cpu().tolist()):
+        sample = dataset.samples[int(sample_index)]
+        fallback = f"{sample.get('scene_name', 'unknown')}__{sample.get('timestamp_us', sample_index)}"
+        group_id = str(sample.get("group_id") or fallback)
+        bucket = groups.setdefault(group_id, {"pos": [], "neg": []})
+        if float(labels[row].detach().item()) > 0.5:
+            bucket["pos"].append(logits[row])
+        else:
+            bucket["neg"].append(logits[row])
+
+    losses: List[torch.Tensor] = []
+    correct = 0.0
+    count = 0.0
+    for bucket in groups.values():
+        if not bucket["pos"] or not bucket["neg"]:
+            continue
+        pos_logits = torch.stack(bucket["pos"])
+        neg_logits = torch.stack(bucket["neg"])
+        pairwise = margin - pos_logits[:, None] + neg_logits[None, :]
+        losses.append(F.softplus(pairwise).mean())
+        count += 1.0
+        if pos_logits.max().item() > neg_logits.max().item():
+            correct += 1.0
+
+    if not losses:
+        zero = logits.sum() * 0.0
+        return zero, zero.detach(), zero.detach()
+    loss = torch.stack(losses).mean()
+    acc = torch.tensor(correct / max(count, 1.0), device=logits.device)
+    group_count = torch.tensor(count, device=logits.device)
+    return loss, acc, group_count
 
 
 def run_consistency_epoch(
@@ -485,6 +711,9 @@ def run_consistency_epoch(
     lambda_steering = float(cfg.get("lambda_steering_consistency", 0.3))
     lambda_progress = float(cfg.get("lambda_progress_consistency", 0.2))
     lambda_temporal = float(cfg.get("lambda_temporal_coherence", 0.2))
+    ranking_cfg = cfg.get("ranking", {})
+    lambda_ranking = float(cfg.get("lambda_group_ranking", ranking_cfg.get("loss_weight", 0.0)))
+    ranking_margin = float(cfg.get("group_ranking_margin", ranking_cfg.get("margin", 0.2)))
     
     # 正样本权重
     c_pw = torch.tensor(
@@ -496,9 +725,7 @@ def run_consistency_epoch(
         device=device,
     )
     
-    # 多维度损失函数
-    criterion_c = nn.BCEWithLogitsLoss(pos_weight=c_pw)
-    criterion_v = nn.BCEWithLogitsLoss(pos_weight=v_pw)
+    # 主任务使用逐样本加权，给难负样本更强梯度。
     criterion_speed = nn.BCEWithLogitsLoss()
     criterion_steering = nn.BCEWithLogitsLoss()
     criterion_progress = nn.BCEWithLogitsLoss()
@@ -511,6 +738,7 @@ def run_consistency_epoch(
     total_steering_loss = 0.0
     total_progress_loss = 0.0
     total_temporal_loss = 0.0
+    total_ranking_loss = 0.0
     
     total_c_correct = 0.0
     total_v_correct = 0.0
@@ -518,12 +746,18 @@ def run_consistency_epoch(
     total_steering_correct = 0.0
     total_progress_correct = 0.0
     total_temporal_correct = 0.0
+    total_ranking_correct = 0.0
+    total_ranking_groups = 0.0
     
     total_samples = 0
     log_interval = int(cfg["log_interval"])
+    ranking_dataset = getattr(getattr(loader, "batch_sampler", None), "dataset", None)
 
     if training and isinstance(loader.sampler, DistributedSampler):
         loader.sampler.set_epoch(epoch)
+    batch_sampler = getattr(loader, "batch_sampler", None)
+    if training and hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)
 
     for step, batch in enumerate(loader, start=1):
         h_imgs = batch["history_images"].to(device, non_blocking=True)
@@ -532,6 +766,15 @@ def run_consistency_epoch(
         traj = batch["candidate_traj"].to(device, non_blocking=True)
         c_labels = batch["consistency_label"].to(device, non_blocking=True)
         v_labels = batch["validity_label"].to(device, non_blocking=True)
+        c_weights = batch.get("consistency_weight", torch.ones_like(c_labels)).to(
+            device, non_blocking=True,
+        )
+        v_weights = batch.get("validity_weight", torch.ones_like(v_labels)).to(
+            device, non_blocking=True,
+        )
+        sample_indices = batch.get("sample_index", torch.empty(0, dtype=torch.long)).to(
+            device, non_blocking=True,
+        )
         
         # 多维度标签（如果存在）
         speed_labels = batch.get("speed_consistency_label", c_labels).to(device, non_blocking=True)
@@ -543,12 +786,29 @@ def run_consistency_epoch(
             out = model(h_imgs, f_imgs, ego, traj)
             
             # 多维度损失计算
-            loss_c = criterion_c(out["consistency_logit"], c_labels)
-            loss_v = criterion_v(out["validity_logit"], v_labels)
+            raw_loss_c = F.binary_cross_entropy_with_logits(
+                out["consistency_logit"], c_labels,
+                pos_weight=c_pw,
+                reduction="none",
+            )
+            raw_loss_v = F.binary_cross_entropy_with_logits(
+                out["validity_logit"], v_labels,
+                pos_weight=v_pw,
+                reduction="none",
+            )
+            loss_c = (raw_loss_c * c_weights).sum() / c_weights.sum().clamp_min(1.0)
+            loss_v = (raw_loss_v * v_weights).sum() / v_weights.sum().clamp_min(1.0)
             loss_speed = criterion_speed(out["speed_consistency_logit"], speed_labels)
             loss_steering = criterion_steering(out["steering_consistency_logit"], steering_labels)
             loss_progress = criterion_progress(out["progress_consistency_logit"], progress_labels)
             loss_temporal = criterion_temporal(out["temporal_coherence_logit"], temporal_labels)
+            loss_ranking, ranking_acc, ranking_groups = compute_group_ranking_loss(
+                logits=out["consistency_logit"],
+                labels=c_labels,
+                sample_indices=sample_indices,
+                dataset=ranking_dataset,
+                margin=ranking_margin,
+            )
             
             # 加权组合
             loss = (lambda_c * loss_c + 
@@ -556,7 +816,8 @@ def run_consistency_epoch(
                    lambda_speed * loss_speed +
                    lambda_steering * loss_steering +
                    lambda_progress * loss_progress +
-                   lambda_temporal * loss_temporal)
+                   lambda_temporal * loss_temporal +
+                   lambda_ranking * loss_ranking)
             
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -580,6 +841,7 @@ def run_consistency_epoch(
         total_steering_loss += loss_steering.detach().item() * bs
         total_progress_loss += loss_progress.detach().item() * bs
         total_temporal_loss += loss_temporal.detach().item() * bs
+        total_ranking_loss += loss_ranking.detach().item() * bs
         
         total_c_correct += (c_preds == c_labels).float().sum().item()
         total_v_correct += (v_preds == v_labels).float().sum().item()
@@ -587,6 +849,8 @@ def run_consistency_epoch(
         total_steering_correct += (steering_preds == steering_labels).float().sum().item()
         total_progress_correct += (progress_preds == progress_labels).float().sum().item()
         total_temporal_correct += (temporal_preds == temporal_labels).float().sum().item()
+        total_ranking_correct += ranking_acc.detach().item() * ranking_groups.detach().item()
+        total_ranking_groups += ranking_groups.detach().item()
         
         total_samples += bs
 
@@ -596,7 +860,8 @@ def run_consistency_epoch(
                 f"[{phase}] epoch={epoch} step={step}/{len(loader)} "
                 f"loss={loss.detach().item():.4f} "
                 f"c_loss={loss_c.detach().item():.4f} "
-                f"v_loss={loss_v.detach().item():.4f}",
+                f"v_loss={loss_v.detach().item():.4f} "
+                f"rank_loss={loss_ranking.detach().item():.4f}",
                 flush=True,
             )
         if max_steps and step >= max_steps:
@@ -611,15 +876,18 @@ def run_consistency_epoch(
         [
             total_loss, total_c_loss, total_v_loss,
             total_speed_loss, total_steering_loss, total_progress_loss, total_temporal_loss,
+            total_ranking_loss,
             total_c_correct, total_v_correct,
             total_speed_correct, total_steering_correct, total_progress_correct, total_temporal_correct,
+            total_ranking_correct, total_ranking_groups,
             float(total_samples),
         ],
         dtype=torch.float64,
         device=device,
     )
     metrics = reduce_mean(metrics)
-    n = max(float(metrics[13].item()), 1.0)
+    n = max(float(metrics[16].item()), 1.0)
+    rank_groups = max(float(metrics[15].item()), 1.0)
     return {
         "loss": float(metrics[0].item() / n),
         "c_loss": float(metrics[1].item() / n),
@@ -628,17 +896,47 @@ def run_consistency_epoch(
         "steering_loss": float(metrics[4].item() / n),
         "progress_loss": float(metrics[5].item() / n),
         "temporal_loss": float(metrics[6].item() / n),
-        "c_acc": float(metrics[7].item() / n),
-        "v_acc": float(metrics[8].item() / n),
-        "speed_acc": float(metrics[9].item() / n),
-        "steering_acc": float(metrics[10].item() / n),
-        "progress_acc": float(metrics[11].item() / n),
-        "temporal_acc": float(metrics[12].item() / n),
+        "ranking_loss": float(metrics[7].item() / n),
+        "c_acc": float(metrics[8].item() / n),
+        "v_acc": float(metrics[9].item() / n),
+        "speed_acc": float(metrics[10].item() / n),
+        "steering_acc": float(metrics[11].item() / n),
+        "progress_acc": float(metrics[12].item() / n),
+        "temporal_acc": float(metrics[13].item() / n),
+        "ranking_acc": float(metrics[14].item() / rank_groups),
+        "ranking_groups": float(metrics[15].item()),
     }
 
 
 def build_dataloader(cfg: Dict[str, Any], index_path: str, training: bool) -> DataLoader:
     dataset = ConsistencyDataset(index_path=index_path, cfg=cfg, training=training)
+    ranking_cfg = cfg.get("ranking", {})
+    lambda_ranking = float(
+        cfg.get("lambda_group_ranking", ranking_cfg.get("loss_weight", 0.0)),
+    )
+    use_group_batches = bool(ranking_cfg.get("group_batches", lambda_ranking > 0.0))
+    if use_group_batches:
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = (
+            dist.get_world_size()
+            if dist.is_available() and dist.is_initialized()
+            else 1
+        )
+        batch_sampler = GroupBatchSampler(
+            dataset=dataset,
+            batch_size=int(cfg["batch_size"]),
+            shuffle=training,
+            drop_last=training,
+            seed=int(cfg.get("seed", 42)),
+            rank=rank,
+            world_size=world_size,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=int(cfg["num_workers"]),
+            pin_memory=True,
+        )
     sampler = None
     if dist.is_available() and dist.is_initialized():
         sampler = DistributedSampler(dataset, shuffle=training, drop_last=training)
@@ -654,8 +952,10 @@ def build_dataloader(cfg: Dict[str, Any], index_path: str, training: bool) -> Da
 
 
 def _preflight_indices(num_items: int, max_samples: int, seed: int) -> List[int]:
-    if max_samples <= 0 or num_items <= max_samples:
+    if max_samples < 0 or num_items <= max_samples:
         return list(range(num_items))
+    if max_samples == 1:
+        return [0]
     rng = random.Random(seed)
     picked = {0, num_items - 1}
     picked.update(rng.sample(range(num_items), max_samples - len(picked)))
@@ -673,7 +973,7 @@ def validate_index_image_paths(
     for index_path in index_paths:
         dataset = ConsistencyDataset(index_path=index_path, cfg=cfg, training=False)
         indices = _preflight_indices(len(dataset), max_samples, int(cfg.get("seed", 42)))
-        missing: List[str] = []
+        bad_images: List[str] = []
         checked = 0
         for idx in indices:
             sample = dataset.samples[idx]
@@ -687,19 +987,27 @@ def validate_index_image_paths(
             )
             for path in image_paths:
                 checked += 1
-                if not path.exists():
-                    missing.append(str(path))
-                    if len(missing) >= 10:
+                if not path.exists() or path.stat().st_size == 0:
+                    bad_images.append(str(path))
+                    if len(bad_images) >= 10:
                         break
-            if len(missing) >= 10:
+                    continue
+                try:
+                    with Image.open(path) as img:
+                        img.verify()
+                except Exception as exc:
+                    bad_images.append(f"{path} ({type(exc).__name__})")
+                    if len(bad_images) >= 10:
+                        break
+            if len(bad_images) >= 10:
                 break
-        if missing:
-            preview = "\n  ".join(missing)
+        if bad_images:
+            preview = "\n  ".join(bad_images)
             raise FileNotFoundError(
                 f"索引图片预检失败: {index_path}\n"
                 f"image_root={cfg['image_root']}\n"
                 f"检查样本数={len(indices)}, 图片数={checked}\n"
-                f"缺失示例:\n  {preview}"
+                f"坏图/缺失示例:\n  {preview}"
             )
         print(
             f"[Preflight] {index_path}: "
@@ -767,7 +1075,7 @@ def main() -> None:
         with (work_dir / "config_snapshot.json").open("w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-    if is_main_process() and int(args.preflight_samples) > 0:
+    if is_main_process() and int(args.preflight_samples) != 0:
         validate_index_image_paths(
             cfg,
             [cfg["train_index"], cfg["val_index"]],
@@ -848,9 +1156,11 @@ def main() -> None:
                     f"steering_acc={train_metrics['steering_acc']:.4f} "
                     f"progress_acc={train_metrics['progress_acc']:.4f} "
                     f"temporal_acc={train_metrics['temporal_acc']:.4f} "
+                    f"rank_acc={train_metrics['ranking_acc']:.4f} "
                     f"val_loss={val_metrics['loss']:.4f} "
                     f"val_c_acc={val_metrics['c_acc']:.4f} "
-                    f"val_v_acc={val_metrics['v_acc']:.4f}"
+                    f"val_v_acc={val_metrics['v_acc']:.4f} "
+                    f"val_rank_acc={val_metrics['ranking_acc']:.4f}"
                 )
                 if epoch % int(cfg["save_interval"]) == 0:
                     save_checkpoint(
