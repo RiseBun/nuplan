@@ -53,6 +53,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-channel", default="CAM_F0")
     parser.add_argument("--history-num-frames", type=int, default=4)
     parser.add_argument(
+        "--history-image-offsets",
+        type=float,
+        nargs="+",
+        default=[-1.5, -1.0, -0.5, 0.0],
+        help="历史图像时间偏移 (秒)，默认 -1.5/-1.0/-0.5/0.0s 共 4 帧",
+    )
+    parser.add_argument(
         "--future-image-offsets",
         type=float,
         nargs="+",
@@ -239,6 +246,7 @@ def load_scene_anchors(
     image_root: Path,
     camera_channel: str,
     history_num_frames: int,
+    history_image_offsets: List[float],
     future_image_offsets: List[float],
     future_steps: int,
     future_step_time_s: float,
@@ -333,15 +341,27 @@ def load_scene_anchors(
         )
 
         # ---- 历史图像 ----
-        hist_rows = image_rows[img_idx - history_num_frames + 1: img_idx + 1]
+        # Use timestamp offsets instead of adjacent camera frames. Adjacent frames
+        # are often visually redundant and carry little motion information.
+        hist_rows = []
+        history_ok = True
+        for offset_s in history_image_offsets:
+            target_ts = current_ts + int(offset_s * 1e6)
+            hi_idx = _find_nearest_image_index(image_timestamps, target_ts)
+            if hi_idx < 0:
+                history_ok = False
+                break
+            hi_row = image_rows[hi_idx]
+            if not is_usable_image_file(image_root / hi_row["filename_jpg"]):
+                history_ok = False
+                break
+            hist_rows.append(hi_row)
+        if not history_ok:
+            continue
         history_images = [
             str(Path(root_prefix) / str(h["filename_jpg"]))
             for h in hist_rows
         ]
-        if not all(
-            is_usable_image_file(image_root / h["filename_jpg"]) for h in hist_rows
-        ):
-            continue
 
         # ---- 未来图像 ----
         future_images: List[str] = []
@@ -871,6 +891,7 @@ def main() -> None:
             image_root=image_root,
             camera_channel=args.camera_channel,
             history_num_frames=args.history_num_frames,
+            history_image_offsets=args.history_image_offsets,
             future_image_offsets=args.future_image_offsets,
             future_steps=args.future_steps,
             future_step_time_s=args.future_step_time_s,
@@ -954,6 +975,7 @@ def main() -> None:
     summary = {
         "camera_channel": args.camera_channel,
         "history_num_frames": args.history_num_frames,
+        "history_image_offsets": args.history_image_offsets,
         "future_image_offsets": args.future_image_offsets,
         "future_steps": args.future_steps,
         "future_step_time_s": args.future_step_time_s,

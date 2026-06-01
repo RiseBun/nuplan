@@ -33,6 +33,13 @@ IAC 的主输出是连续分数，不建议只看固定 `0.5` 阈值。阈值属
 - `ego_state`：当前自车状态，例如速度、加速度、yaw、yaw rate 等。
 - `candidate_traj`：待评测的未来轨迹，表示一个动作或动作序列。
 
+当前索引构建默认按时间偏移抽取历史和未来图像，而不是取相邻相机帧：
+
+- `history_images`：`-1.5s, -1.0s, -0.5s, 0.0s`
+- `future_images`：`+0.5s, +1.0s, +1.5s, +2.0s`
+
+这样历史序列包含真实运动变化，避免连续相机帧几乎完全相同、信息量不足的问题。可以用 `--history-image-offsets` 和 `--future-image-offsets` 覆盖这两个时间窗口。
+
 WAM benchmark 的 JSONL 输入示例：
 
 ```json
@@ -113,10 +120,14 @@ IAC 使用自监督/弱监督构造训练样本，不需要人工标注“图像
 python tools/build_consistency_index.py \
   --db-root "$NUPLAN_DB_ROOT" \
   --image-roots /path/to/nuplan-v1.1_mini_camera_0 /path/to/nuplan-v1.1_mini_camera_1 \
-  --output-dir indices_v3
+  --output-dir indices_v4 \
+  --history-image-offsets -1.5 -1.0 -0.5 0.0 \
+  --future-image-offsets 0.5 1.0 1.5 2.0
 ```
 
 如果你已经解压更多 nuPlan camera shard，可以把所有 camera 根目录传入 `--image-roots`，或设置 `NUPLAN_CAMERA_ROOTS`。未设置环境变量时，脚本会自动发现 `NUPLAN_DATA_ROOT` 下的全部 camera shard。默认只使用前向 `CAM_F0`，这是当前 V1 benchmark 的公平接口；多相机版本后续再扩展模型输入。
+
+重建索引后，需要把 `NUPLAN_INDEX_ROOT` 或 `data_paths.py` 指向新的索引目录，例如 `indices_v4`，再重新训练 checkpoint。旧 checkpoint 仍然对应旧索引和旧历史帧采样规则。
 
 训练 IAC Critic：
 
@@ -169,7 +180,7 @@ python benchmark_wam.py \
 ```bash
 export NUPLAN_DATA_ROOT=/path/to/data-root
 export NUPLAN_DB_ROOT=/path/to/data/cache/mini
-export NUPLAN_INDEX_ROOT=/path/to/IAC/indices_v3
+export NUPLAN_INDEX_ROOT=/path/to/IAC/indices_v4
 export NUPLAN_CAMERA_ROOTS="/path/to/camera_0:/path/to/camera_1"
 ```
 
