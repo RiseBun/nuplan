@@ -106,7 +106,15 @@ IAC 使用自监督/弱监督构造训练样本，不需要人工标注“图像
 
 这些负样本让模型学习“图像变化应该和动作一致”，而不是只记住图像质量或轨迹平滑度。为了降低标签噪声，当前默认构造更可见的扰动，并为每个 anchor 写入 `group_id`，让同一真实未来下的正样本和负候选可以组成 ranking 评测组。
 
-训练时使用二分类损失作为基础监督，但 benchmark 不只看二分类 accuracy。更重要的是：
+训练时使用二分类损失作为基础监督，并额外加入同组排序损失：
+
+```text
+loss = BCE(consistency) + 0.5 * BCE(validity) + 0.2 * group_ranking_loss
+```
+
+`group_ranking_loss` 只在同一 `group_id` 内比较候选，目标是让真实匹配轨迹的 `consistency` logit 高于负候选。这和 WAM benchmark 的实际用途更一致：同一场景下，模型不仅要判断单个样本是否一致，还要把最匹配的候选动作排在前面。
+
+因此 benchmark 不只看二分类 accuracy。更重要的是：
 
 - 连续分数排序能力：`AUC` / `PR-AUC`。
 - 同一 `group_id` 下的候选排序：`Top-1 Hit Rate` / `MRR` / `NDCG`。
@@ -134,13 +142,13 @@ python tools/build_consistency_index.py \
 ```bash
 PYTHONUNBUFFERED=1 python -m torch.distributed.run \
   --nproc_per_node=2 \
-  --master_port=29606 \
+  --master_port=29619 \
   train.py \
   --config configs/train_consistency_mini.py \
-  --work-dir work_dirs/iac_5epoch_2gpu \
+  --work-dir work_dirs/iac_v4_gru_rank_2gpu_b96_w16 \
   --epochs 5 \
-  --batch-size 8 \
-  --num-workers 4 \
+  --batch-size 96 \
+  --num-workers 16 \
   --preflight-samples 256
 ```
 
@@ -148,10 +156,13 @@ PYTHONUNBUFFERED=1 python -m torch.distributed.run \
 
 ```bash
 python eval_critic.py \
-  --checkpoint work_dirs/iac_5epoch_2gpu/checkpoints/best.pth \
+  --checkpoint work_dirs/iac_v4_gru_rank_2gpu_b96_w16/checkpoints/best.pth \
   --split val \
-  --batch-size 32 \
-  --eval-ranking
+  --batch-size 128 \
+  --num-workers 8 \
+  --max-samples 4096 \
+  --eval-ranking \
+  --output-prefix epoch5_quick_val_4096_rank
 ```
 
 评测 WAM 输出：
@@ -159,7 +170,7 @@ python eval_critic.py \
 ```bash
 python benchmark_wam.py \
   --input path/to/wam_outputs.jsonl \
-  --checkpoint work_dirs/iac_5epoch_2gpu/checkpoints/best.pth \
+  --checkpoint work_dirs/iac_v4_gru_rank_2gpu_b96_w16/checkpoints/best.pth \
   --output-dir work_dirs/wam_benchmark/my_wam \
   --consistency-threshold 0.31 \
   --validity-threshold 0.97

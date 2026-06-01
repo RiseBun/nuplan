@@ -36,7 +36,7 @@ DB_ROOT = _path_from_env(
     "NUPLAN_DB_ROOT",
     WORKSPACE_ROOT / "data" / "cache" / "mini",
 )
-INDEX_ROOT = _path_from_env("NUPLAN_INDEX_ROOT", PROJECT_ROOT / "indices_v3")
+INDEX_ROOT = _path_from_env("NUPLAN_INDEX_ROOT", PROJECT_ROOT / "indices_v4")
 GENERATED_DATA_ROOT = _path_from_env(
     "NUPLAN_GENERATED_DATA_ROOT",
     PROJECT_ROOT / "generated_data",
